@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P&A LP Dashboard</title>
+    <link rel="icon" href="img/pna-logo.jpg">
+    <link rel="stylesheet" href="css/dashboard.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="logo">
+                <img src="img/pna-logo.jpg" alt="P&A" class="logo-img">
+                <span class="logo-text">P&A Dashboard</span>
+            </div>
+
+            <nav class="nav">
+                <a href="#" class="nav-item active" data-page="overview">
+                    <span class="nav-icon">&#9632;</span>
+                    Overview
+                </a>
+                <a href="#" class="nav-item" data-page="chains">
+                    <span class="nav-icon">&#9734;</span>
+                    Chains
+                </a>
+                <a href="#" class="nav-item" data-page="config">
+                    <span class="nav-icon">&#9881;</span>
+                    LP Config
+                </a>
+                <a href="#" class="nav-item" data-page="swaps">
+                    <span class="nav-icon">&#8644;</span>
+                    Swaps
+                </a>
+                <a href="#" class="nav-item" data-page="wallets">
+                    <span class="nav-icon">&#9733;</span>
+                    Wallets
+                </a>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="status-indicator">
+                    <span class="status-dot" id="api-status"></span>
+                    <span id="api-status-text">Connecting...</span>
+                </div>
+                <div class="version">SDK v0.1.0</div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main">
+            <!-- Overview Page -->
+            <section id="page-overview" class="page active">
+                <header class="page-header">
+                    <h1>Overview <span id="test-mode-badge" style="display:none; background:#ff9800; color:#fff; font-size:0.5em; padding:2px 8px; border-radius:4px; vertical-align:middle;">TEST MODE (spread=0)</span></h1>
+                    <div class="header-actions">
+                        <span class="last-update">Last update: <span id="last-update-time">-</span></span>
+                    </div>
+                </header>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Active Swaps</div>
+                        <div class="stat-value" id="stat-active-swaps">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Total Swaps</div>
+                        <div class="stat-value" id="stat-total-swaps">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Volume (24h)</div>
+                        <div class="stat-value" id="stat-volume">$0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Earnings (24h)</div>
+                        <div class="stat-value highlight" id="stat-earnings">$0</div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Chain Status</h2>
+                    <div class="chain-status-grid" id="chain-status-grid">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Recent Swaps</h2>
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Pair</th>
+                                <th>Amount</th>
+                                <th>Status</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recent-swaps-table">
+                            <tr><td colspan="5" class="empty">No swaps yet</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Chains Page -->
+            <section id="page-chains" class="page">
+                <header class="page-header">
+                    <h1>Chain Configuration</h1>
+                </header>
+
+                <div class="chains-grid">
+                    <!-- BTC -->
+                    <div class="chain-card" data-chain="btc">
+                        <div class="chain-header">
+                            <span class="chain-icon" style="color: #f7931a">&#8383;</span>
+                            <div>
+                                <h3>Bitcoin</h3>
+                                <span class="chain-network">Signet</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="chain-btc-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="chain-body">
+                            <div class="install-section" id="btc-install-section">
+                                <div class="install-status" id="btc-install-status">
+                                    <span class="status-icon">&#9744;</span>
+                                    <span>Not installed</span>
+                                </div>
+                                <button class="btn btn-install" id="btc-install-btn" onclick="installChain('btc')">
+                                    <span class="btn-icon">&#8595;</span> Install Bitcoin Signet
+                                </button>
+                                <div class="install-progress hidden" id="btc-install-progress">
+                                    <div class="progress-bar"><div class="progress-fill" id="btc-progress-fill"></div></div>
+                                    <div class="progress-text" id="btc-progress-text">Installing...</div>
+                                </div>
+                            </div>
+                            <div class="config-section" id="btc-config-section">
+                                <div class="form-group">
+                                    <label>RPC URL</label>
+                                    <input type="text" id="btc-rpc" placeholder="http://localhost:38332" value="http://localhost:38332">
+                                </div>
+                                <div class="form-group">
+                                    <label>RPC User</label>
+                                    <input type="text" id="btc-rpc-user" placeholder="user">
+                                </div>
+                                <div class="form-group">
+                                    <label>RPC Password</label>
+                                    <input type="password" id="btc-rpc-pass" placeholder="password">
+                                </div>
+                            </div>
+                            <div class="chain-status" id="btc-chain-status">
+                                <span class="status-dot disconnected"></span>
+                                <span>Not connected</span>
+                            </div>
+                            <div class="sync-progress hidden" id="btc-sync-progress">
+                                <div class="progress-bar"><div class="progress-fill" id="btc-sync-fill"></div></div>
+                                <div class="progress-text" id="btc-sync-text">Syncing...</div>
+                            </div>
+                            <div class="chain-actions">
+                                <button class="btn btn-secondary" onclick="testChainConnection('btc')">Test Connection</button>
+                                <button class="btn btn-secondary" onclick="startChain('btc')">Start</button>
+                                <button class="btn btn-secondary" onclick="stopChain('btc')">Stop</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- BATHRON / M1 -->
+                    <div class="chain-card" data-chain="m1">
+                        <div class="chain-header">
+                            <span class="chain-icon" style="color: #3b82f6">M</span>
+                            <div>
+                                <h3>BATHRON (M1)</h3>
+                                <span class="chain-network">Testnet</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="chain-m1-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="chain-body">
+                            <div class="install-section" id="m1-install-section">
+                                <div class="install-status" id="m1-install-status">
+                                    <span class="status-icon">&#9744;</span>
+                                    <span>Not installed</span>
+                                </div>
+                                <button class="btn btn-install" id="m1-install-btn" onclick="installChain('m1')">
+                                    <span class="btn-icon">&#8595;</span> Install BATHRON Node
+                                </button>
+                                <div class="install-progress hidden" id="m1-install-progress">
+                                    <div class="progress-bar"><div class="progress-fill" id="m1-progress-fill"></div></div>
+                                    <div class="progress-text" id="m1-progress-text">Installing...</div>
+                                </div>
+                            </div>
+                            <div class="config-section" id="m1-config-section">
+                                <div class="form-group">
+                                    <label>RPC URL</label>
+                                    <input type="text" id="m1-rpc" placeholder="http://localhost:27172" value="http://localhost:27172">
+                                </div>
+                                <div class="form-group">
+                                    <label>RPC User</label>
+                                    <input type="text" id="m1-rpc-user" placeholder="user">
+                                </div>
+                                <div class="form-group">
+                                    <label>RPC Password</label>
+                                    <input type="password" id="m1-rpc-pass" placeholder="password">
+                                </div>
+                                <div class="form-row">
+                                    <label class="checkbox-label">
+                                        <input type="checkbox" id="m1-masternode">
+                                        Run as Masternode
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="chain-status" id="m1-chain-status">
+                                <span class="status-dot disconnected"></span>
+                                <span>Not connected</span>
+                            </div>
+                            <div class="sync-progress hidden" id="m1-sync-progress">
+                                <div class="progress-bar"><div class="progress-fill" id="m1-sync-fill"></div></div>
+                                <div class="progress-text" id="m1-sync-text">Syncing...</div>
+                            </div>
+                            <div class="chain-actions">
+                                <button class="btn btn-secondary" onclick="testChainConnection('m1')">Test Connection</button>
+                                <button class="btn btn-secondary" onclick="startChain('m1')">Start</button>
+                                <button class="btn btn-secondary" onclick="stopChain('m1')">Stop</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Base / USDC -->
+                    <div class="chain-card" data-chain="usdc">
+                        <div class="chain-header">
+                            <span class="chain-icon" style="color: #2775ca">$</span>
+                            <div>
+                                <h3>USDC on Base</h3>
+                                <span class="chain-network">Base Sepolia (Testnet)</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="chain-usdc-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="chain-body">
+                            <div class="install-section" id="usdc-install-section">
+                                <div class="install-status installed" id="usdc-install-status">
+                                    <span class="status-icon">&#10003;</span>
+                                    <span>No install needed (RPC only)</span>
+                                </div>
+                            </div>
+                            <div class="config-section" id="usdc-config-section">
+                                <div class="form-group">
+                                    <label>RPC URL (Base Sepolia)</label>
+                                    <input type="text" id="usdc-rpc" placeholder="https://sepolia.base.org" value="https://sepolia.base.org">
+                                    <span class="form-hint">Public RPC or your own node</span>
+                                </div>
+                                <div class="form-group">
+                                    <label>Private Key (for signing)</label>
+                                    <input type="password" id="usdc-privkey" placeholder="0x...">
+                                    <span class="form-hint">Your LP wallet private key</span>
+                                </div>
+                                <div class="form-group">
+                                    <label>HTLC Contract Address</label>
+                                    <input type="text" id="usdc-htlc-contract" placeholder="0x...">
+                                    <button class="btn btn-sm" onclick="deployHTLCContract()">Deploy New</button>
+                                </div>
+                            </div>
+                            <div class="chain-status" id="usdc-chain-status">
+                                <span class="status-dot disconnected"></span>
+                                <span>Not connected</span>
+                            </div>
+                            <div class="chain-actions">
+                                <button class="btn btn-secondary" onclick="testChainConnection('usdc')">Test Connection</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="actions-bar">
+                    <button class="btn btn-primary" onclick="saveChainConfig()">Save Configuration</button>
+                </div>
+            </section>
+
+            <!-- LP Config Page -->
+            <section id="page-config" class="page">
+                <header class="page-header">
+                    <h1>LP Pricing Configuration</h1>
+                    <div class="header-actions">
+                        <button class="btn btn-secondary" onclick="refreshAllRates()">Refresh All Rates</button>
+                    </div>
+                </header>
+
+                <!-- Pair Pricing Cards -->
+                <div class="pair-config-grid">
+                    <!-- BTC/M1 Pair - FIXED RATE -->
+                    <div class="pair-card fixed-rate" data-pair="btc-m1">
+                        <div class="pair-header">
+                            <div class="pair-icons">
+                                <span class="pair-icon" style="color: #f7931a">&#8383;</span>
+                                <span class="pair-separator">/</span>
+                                <span class="pair-icon" style="color: #3b82f6">M</span>
+                            </div>
+                            <div class="pair-title">
+                                <h3>BTC / M1</h3>
+                                <span class="pair-subtitle">Fixed rate: 1 SAT = 1 M1</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="pair-btc-m1-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="pair-body">
+                            <div class="fixed-rate-info">
+                                <div class="fixed-rate-display">
+                                    <span class="fixed-label">Protocol Rate</span>
+                                    <span class="fixed-value">1 SAT = 1 M1</span>
+                                </div>
+                                <div class="fixed-rate-display">
+                                    <span class="fixed-label">Equivalent</span>
+                                    <span class="fixed-value">1 BTC = 100,000,000 M1</span>
+                                </div>
+                                <p class="fixed-note">This rate is fixed by protocol. Configure your spread below.</p>
+                            </div>
+                            <div class="pair-spread">
+                                <h4>Your Spread</h4>
+                                <div class="spread-inputs-row">
+                                    <div class="spread-input-group">
+                                        <label>Bid (user sells BTC)</label>
+                                        <div class="spread-input">
+                                            <input type="number" id="btc-m1-spread-bid" value="0.5" min="0" max="10" step="0.1">
+                                            <span>%</span>
+                                        </div>
+                                    </div>
+                                    <div class="spread-input-group">
+                                        <label>Ask (user buys BTC)</label>
+                                        <div class="spread-input">
+                                            <input type="number" id="btc-m1-spread-ask" value="0.5" min="0" max="10" step="0.1">
+                                            <span>%</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="pair-limits">
+                                <h4>Inventory</h4>
+                                <div class="limits-row">
+                                    <div class="limit-input">
+                                        <label>Min par swap</label>
+                                        <input type="number" id="btc-m1-min" value="0.0001" step="0.0001">
+                                    </div>
+                                    <div class="limit-input">
+                                        <label>Inventaire Max</label>
+                                        <input type="number" id="btc-m1-max" value="1.0" step="0.1">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- BTC Confirmation Config - Risk Management -->
+                            <div class="pair-confirmations">
+                                <h4>BTC Confirmations (Risk/Speed)</h4>
+                                <p class="config-hint">Plus de confirmations = plus sûr mais plus lent. Le LP assume le risque de reorg.</p>
+                                <div class="confirmations-tiers">
+                                    <div class="tier-header">
+                                        <span>Montant max</span>
+                                        <span>Confirmations</span>
+                                        <span>Temps (~)</span>
+                                    </div>
+                                    <div class="tier-row">
+                                        <span class="tier-amount">&lt; 0.01 BTC</span>
+                                        <input type="number" id="btc-conf-tier-1" value="1" min="1" max="6" class="tier-input">
+                                        <span class="tier-time" id="btc-conf-tier-1-time">~10 min</span>
+                                    </div>
+                                    <div class="tier-row">
+                                        <span class="tier-amount">&lt; 0.1 BTC</span>
+                                        <input type="number" id="btc-conf-tier-2" value="2" min="1" max="6" class="tier-input">
+                                        <span class="tier-time" id="btc-conf-tier-2-time">~20 min</span>
+                                    </div>
+                                    <div class="tier-row">
+                                        <span class="tier-amount">&lt; 0.5 BTC</span>
+                                        <input type="number" id="btc-conf-tier-3" value="3" min="1" max="6" class="tier-input">
+                                        <span class="tier-time" id="btc-conf-tier-3-time">~30 min</span>
+                                    </div>
+                                    <div class="tier-row">
+                                        <span class="tier-amount">&ge; 0.5 BTC</span>
+                                        <input type="number" id="btc-conf-tier-4" value="6" min="1" max="6" class="tier-input">
+                                        <span class="tier-time" id="btc-conf-tier-4-time">~60 min</span>
+                                    </div>
+                                </div>
+                                <p class="config-note">THORChain utilise 3 conf par défaut. 1 conf = risque ~$50k/reorg pour l'attaquant.</p>
+                            </div>
+
+                            <div class="pair-preview">
+                                <div class="preview-rate">
+                                    <span class="preview-label">Base Rate:</span>
+                                    <span class="preview-value" id="btc-m1-rate">1 BTC = 100,000,000 M1</span>
+                                </div>
+                                <div class="preview-rate">
+                                    <span class="preview-label">Your Bid (user sells BTC to you):</span>
+                                    <span class="preview-value highlight" id="btc-m1-bid">1 BTC = 99,500,000 M1</span>
+                                </div>
+                                <div class="preview-rate">
+                                    <span class="preview-label">Your Ask (user buys BTC from you):</span>
+                                    <span class="preview-value highlight" id="btc-m1-ask">1 BTC = 100,500,000 M1</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- USDC/M1 Pair -->
+                    <div class="pair-card" data-pair="usdc-m1">
+                        <div class="pair-header">
+                            <div class="pair-icons">
+                                <span class="pair-icon" style="color: #2775ca">$</span>
+                                <span class="pair-separator">/</span>
+                                <span class="pair-icon" style="color: #3b82f6">M</span>
+                            </div>
+                            <div class="pair-title">
+                                <h3>USDC / M1</h3>
+                                <span class="pair-subtitle">Prix via sources configurables</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="pair-usdc-m1-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="pair-body">
+                            <div class="pair-sources">
+                                <div class="sources-header">
+                                    <h4>Sources de Prix</h4>
+                                    <span class="refresh-info">Refresh: <span id="refresh-interval-display">10s</span></span>
+                                </div>
+
+                                <!-- Dynamic sources list -->
+                                <div class="sources-list" id="usdc-m1-sources-list">
+                                    <!-- Sources will be added here by JS -->
+                                </div>
+
+                                <div class="sources-footer">
+                                    <div class="weight-total">
+                                        Total: <span id="usdc-m1-weight-total">0</span>%
+                                        <span class="weight-warning" id="usdc-m1-weight-warn">(doit être 100%)</span>
+                                    </div>
+                                    <button class="btn btn-sm" onclick="collapseAllSources()">Réduire tout</button>
+                                </div>
+
+                                <!-- Add source dropdown -->
+                                <div class="add-source-row">
+                                    <select id="add-source-preset">
+                                        <option value="">+ Ajouter une source...</option>
+                                        <option value="binance_btcusdc">Binance BTCUSDC (recommandé)</option>
+                                        <option value="binance_usdcusdt">Binance USDCUSDT</option>
+                                        <option value="coingecko">CoinGecko</option>
+                                        <option value="kraken">Kraken</option>
+                                        <option value="custom">Custom (URL libre)</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="pair-spread">
+                                <h4>Your Spread</h4>
+                                <div class="spread-inputs-row">
+                                    <div class="spread-input-group">
+                                        <label>Bid (user sells USDC)</label>
+                                        <div class="spread-input">
+                                            <input type="number" id="usdc-m1-spread-bid" value="0.5" min="0" max="10" step="0.1">
+                                            <span>%</span>
+                                        </div>
+                                    </div>
+                                    <div class="spread-input-group">
+                                        <label>Ask (user buys USDC)</label>
+                                        <div class="spread-input">
+                                            <input type="number" id="usdc-m1-spread-ask" value="0.5" min="0" max="10" step="0.1">
+                                            <span>%</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="pair-limits">
+                                <h4>Inventory</h4>
+                                <div class="limits-row">
+                                    <div class="limit-input">
+                                        <label>Min par swap</label>
+                                        <input type="number" id="usdc-m1-min" value="10" step="1">
+                                    </div>
+                                    <div class="limit-input">
+                                        <label>Inventaire Max</label>
+                                        <input type="number" id="usdc-m1-max" value="100000" step="100">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="pair-preview">
+                                <div class="preview-rate">
+                                    <span class="preview-label">Market Rate:</span>
+                                    <span class="preview-value" id="usdc-m1-rate">1 M1 = ? USDC</span>
+                                    <span class="preview-time" id="usdc-m1-last-update">--</span>
+                                </div>
+                                <div class="preview-rate">
+                                    <span class="preview-label">Your Bid (user sells USDC → M1):</span>
+                                    <span class="preview-value highlight" id="usdc-m1-bid">-</span>
+                                </div>
+                                <div class="preview-rate">
+                                    <span class="preview-label">Your Ask (user buys USDC ← M1):</span>
+                                    <span class="preview-value highlight" id="usdc-m1-ask">-</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- BTC/USDC Derived Pair -->
+                    <div class="pair-card derived" data-pair="btc-usdc">
+                        <div class="pair-header">
+                            <div class="pair-icons">
+                                <span class="pair-icon" style="color: #f7931a">&#8383;</span>
+                                <span class="pair-separator">/</span>
+                                <span class="pair-icon" style="color: #2775ca">$</span>
+                            </div>
+                            <div class="pair-title">
+                                <h3>BTC / USDC</h3>
+                                <span class="pair-subtitle">Derived from BTC/M1 and USDC/M1</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="pair-btc-usdc-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="pair-body">
+                            <div class="derived-info">
+                                <p>Calculé automatiquement:</p>
+                                <code>BTC/USDC = (BTC/M1) / (USDC/M1)</code>
+                                <p class="derived-note">Spread = BTC spread + USDC spread</p>
+                            </div>
+                            <div class="pair-preview">
+                                <div class="preview-rate">
+                                    <span class="preview-label">Derived Rate:</span>
+                                    <span class="preview-value" id="btc-usdc-rate">Chargement...</span>
+                                </div>
+                                <div class="preview-rate">
+                                    <span class="preview-label">Your Bid (user sells BTC):</span>
+                                    <span class="preview-value highlight" id="btc-usdc-buy">-</span>
+                                </div>
+                                <div class="preview-rate">
+                                    <span class="preview-label">Your Ask (user buys BTC):</span>
+                                    <span class="preview-value highlight" id="btc-usdc-sell">-</span>
+                                </div>
+                                <div class="preview-rate">
+                                    <span class="preview-label">Combined Spread:</span>
+                                    <span class="preview-value" id="btc-usdc-spread">-</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Global Settings -->
+                <div class="config-section-grid">
+                    <div class="card">
+                        <h2>API Keys</h2>
+                        <p class="card-desc">Configure API keys for price sources (optional for public endpoints)</p>
+                        <div class="form-group">
+                            <label>Binance API Key</label>
+                            <input type="password" id="api-key-binance" placeholder="Optional - for higher rate limits">
+                        </div>
+                        <div class="form-group">
+                            <label>CoinGecko API Key</label>
+                            <input type="password" id="api-key-coingecko" placeholder="Optional - free tier works">
+                        </div>
+                        <div class="form-group">
+                            <label>Kraken API Key</label>
+                            <input type="password" id="api-key-kraken" placeholder="Optional">
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h2>Auto-Operations</h2>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="auto-claim" checked>
+                                Auto-claim completed swaps
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="auto-refund" checked>
+                                Auto-refund expired swaps
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="auto-rebalance">
+                                Auto-rebalance liquidity
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>Rate Refresh Interval</label>
+                            <select id="rate-refresh-interval">
+                                <option value="5">5 seconds</option>
+                                <option value="10" selected>10 seconds</option>
+                                <option value="30">30 seconds</option>
+                                <option value="60">1 minute</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="actions-bar">
+                    <button class="btn btn-secondary" onclick="resetAllConfig()">Reset tout</button>
+                    <button class="btn btn-primary btn-save-all" onclick="saveAllConfig()">Sauvegarder tout</button>
+                </div>
+            </section>
+
+            <!-- Swaps Page -->
+            <section id="page-swaps" class="page">
+                <header class="page-header">
+                    <h1>Swap Management</h1>
+                    <div class="header-actions">
+                        <select id="swap-filter">
+                            <option value="">All Swaps</option>
+                            <option value="pending_deposit">Pending Deposit</option>
+                            <option value="confirming">Confirming</option>
+                            <option value="settling">Settling</option>
+                            <option value="complete">Complete</option>
+                        </select>
+                        <div class="unit-toggle" onclick="toggleM1Unit()">
+                            <span id="unit-label">SAT</span>
+                            <div class="toggle-switch" id="unit-toggle">
+                                <div class="toggle-knob"></div>
+                            </div>
+                            <span id="unit-label-alt">BTC</span>
+                        </div>
+                        <button class="btn btn-secondary" onclick="refreshSwaps()">Refresh</button>
+                    </div>
+                </header>
+
+                <div class="card">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Swap ID</th>
+                                <th>Legs (BTC&rarr;M1&rarr;USDC)</th>
+                                <th>Rate</th>
+                                <th>LP PnL (M1)</th>
+                                <th>Status</th>
+                                <th>Date</th>
+                            </tr>
+                        </thead>
+                        <tbody id="swaps-table">
+                            <tr><td colspan="6" class="empty">No swaps</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Wallets Page -->
+            <section id="page-wallets" class="page">
+                <header class="page-header">
+                    <h1>Wallets</h1>
+                    <div class="header-actions">
+                        <button class="btn btn-secondary btn-sm" onclick="debugWallets()">Debug Info</button>
+                        <button class="btn btn-secondary btn-sm" onclick="loadWallets()">Refresh All</button>
+                    </div>
+                </header>
+
+                <div class="wallets-grid">
+                    <!-- Bitcoin -->
+                    <div class="wallet-card">
+                        <div class="wallet-header">
+                            <span class="wallet-icon" style="color: #f7931a">&#8383;</span>
+                            <h3>Bitcoin</h3>
+                            <button class="btn btn-sm btn-icon" onclick="refreshBalance('btc')" title="Refresh">&#8635;</button>
+                        </div>
+                        <div class="wallet-balance">
+                            <span class="balance-value" id="wallet-btc-balance">0.00000000</span>
+                            <span class="balance-unit">BTC</span>
+                        </div>
+                        <div class="wallet-address-row">
+                            <code id="wallet-btc-address" class="address-fixed">tb1qnc742c35fpra5zfnk9rfw7yplvzdxyfkrt4ckt</code>
+                            <button class="btn btn-sm btn-icon" onclick="copyAddress('btc')" title="Copy">&#128203;</button>
+                        </div>
+                    </div>
+
+                    <!-- M1 (BATHRON) -->
+                    <div class="wallet-card">
+                        <div class="wallet-header">
+                            <span class="wallet-icon" style="color: #3b82f6">M</span>
+                            <h3>M1 (BATHRON)</h3>
+                            <button class="btn btn-sm btn-icon" onclick="refreshBalance('m1')" title="Refresh">&#8635;</button>
+                        </div>
+                        <div class="wallet-balance">
+                            <span class="balance-value" id="wallet-m1-balance">0.00000000</span>
+                            <span class="balance-unit">M1</span>
+                        </div>
+                        <div class="wallet-address-row">
+                            <code id="wallet-m1-address" class="address-fixed">yJYD2bfYYBe6qAojSzMKX949H7QoQifNAo</code>
+                            <button class="btn btn-sm btn-icon" onclick="copyAddress('m1')" title="Copy">&#128203;</button>
+                        </div>
+                    </div>
+
+                    <!-- USDC -->
+                    <div class="wallet-card">
+                        <div class="wallet-header">
+                            <span class="wallet-icon" style="color: #2775ca">$</span>
+                            <h3>USDC (Base)</h3>
+                            <button class="btn btn-sm btn-icon" onclick="refreshBalance('usdc')" title="Refresh">&#8635;</button>
+                        </div>
+                        <div class="wallet-balance">
+                            <span class="balance-value" id="wallet-usdc-balance">0.00</span>
+                            <span class="balance-unit">USDC</span>
+                        </div>
+                        <div class="wallet-balance-secondary" id="wallet-usdc-eth-gas">
+                            0.000000 ETH (gas)
+                        </div>
+                        <div class="wallet-address-row">
+                            <code id="wallet-usdc-address" class="address-fixed">-</code>
+                            <button class="btn btn-sm btn-icon" onclick="copyAddress('usdc')" title="Copy">&#128203;</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-top: 1.5rem;">
+                    <h3>Notes</h3>
+                    <p class="help-text">
+                        • M1 balance includes all UTXOs for addresses labeled <code>lp_pna</code><br>
+                        • Use "Reset" if address/balance mismatch - will re-query the node<br>
+                        • Use "Debug Info" to see detailed UTXO breakdown per address
+                    </p>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="js/dashboard.js"></script>
+</body>
+</html>
