@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/pna-lp
+  IMAGE_NAME: adonisphusis/pna-lp
 
 jobs:
   build:
