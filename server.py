@@ -3978,7 +3978,7 @@ CHAIN_BINARIES = {
     "btc": find_binary("bitcoind", [
         Path.home() / "bitcoin" / "bin" / "bitcoind",          # install_btc_signet.sh
         Path.home() / "btc-signet" / "bin" / "bitcoind",
-        Path.home() / "PIV2-Core" / "BTCTESTNET" / "bitcoin-27.0" / "bin" / "bitcoind",
+        Path.home() / "BATHRON" / "BTCTESTNET" / "bitcoin-27.0" / "bin" / "bitcoind",
         "/usr/local/bin/bitcoind",
     ]),
     "m1": find_binary("bathrond", [
@@ -3992,7 +3992,7 @@ CHAIN_CLI = {
     "btc": find_binary("bitcoin-cli", [
         Path.home() / "bitcoin" / "bin" / "bitcoin-cli",       # install_btc_signet.sh
         Path.home() / "btc-signet" / "bin" / "bitcoin-cli",
-        Path.home() / "PIV2-Core" / "BTCTESTNET" / "bitcoin-27.0" / "bin" / "bitcoin-cli",
+        Path.home() / "BATHRON" / "BTCTESTNET" / "bitcoin-27.0" / "bin" / "bitcoin-cli",
         "/usr/local/bin/bitcoin-cli",
     ]),
     "m1": find_binary("bathron-cli", [
