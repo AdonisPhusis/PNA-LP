@@ -2,15 +2,17 @@ FROM python:3.13-slim
 
 # System deps for python-bitcoinlib and web3
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libffi-dev && \
+    apt-get install -y --no-install-recommends gcc libffi-dev curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Install Python deps first (layer cache — only rebuilds when requirements change)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    apt-get purge -y gcc && apt-get autoremove -y
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Verify critical deps installed
+RUN python3 -c "import fastapi; import uvicorn; import httpx; print('OK: fastapi', fastapi.__version__)"
 
 # Copy application code
 COPY server.py .
