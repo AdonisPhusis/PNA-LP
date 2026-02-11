@@ -478,6 +478,15 @@ if STATIC_DIR.exists():
     app.mount("/js", StaticFiles(directory=STATIC_DIR / "js"), name="js")
     app.mount("/img", StaticFiles(directory=STATIC_DIR / "img"), name="img")
 
+# Include extracted route modules
+from routes.prices import (
+    router as prices_router,
+    fetch_live_btc_usdc_price,
+    configure as configure_prices,
+    close_httpx_client as close_prices_httpx,
+)
+app.include_router(prices_router)
+
 # =============================================================================
 # ENDPOINTS
 # =============================================================================
@@ -538,6 +547,64 @@ async def get_status():
             "blacklisted": reputation["blacklisted"],
         },
     }
+
+
+@app.get("/api/health")
+async def health_check():
+    """Deep health check — verifies BTC and BATHRON node connectivity, liquidity."""
+    checks = {}
+    ok = True
+
+    # BATHRON node
+    try:
+        m1_client = get_m1_client()
+        if m1_client:
+            info = m1_client.get_blockchain_info()
+            checks["bathron"] = {
+                "connected": True,
+                "height": info.get("blocks", 0),
+                "headers": info.get("headers", 0),
+                "chain": info.get("chain", "unknown"),
+            }
+        else:
+            checks["bathron"] = {"connected": False, "error": "client not initialized"}
+            ok = False
+    except Exception as e:
+        checks["bathron"] = {"connected": False, "error": str(e)}
+        ok = False
+
+    # BTC Signet node
+    try:
+        btc_3s = get_btc_htlc_3s()
+        if btc_3s:
+            btc_height = btc_3s.client.get_block_count()
+            checks["btc_signet"] = {"connected": True, "height": btc_height}
+        else:
+            checks["btc_signet"] = {"connected": False, "error": "client not initialized"}
+            ok = False
+    except Exception as e:
+        checks["btc_signet"] = {"connected": False, "error": str(e)}
+        ok = False
+
+    # Liquidity
+    with _flowswap_lock:
+        avail = _get_available_inventory()
+        active_swaps = len([s for s in flowswap_db.values()
+                           if s.get("state") not in TERMINAL_STATES])
+    checks["liquidity"] = {
+        "btc": avail.get("btc", 0),
+        "m1": avail.get("m1", 0),
+        "usdc": avail.get("usdc", 0),
+        "active_swaps": active_swaps,
+    }
+
+    return {
+        "ok": ok,
+        "lp_id": _lp_id,
+        "timestamp": int(time.time()),
+        "checks": checks,
+    }
+
 
 # =============================================================================
 # LP REPUTATION TRACKING
@@ -2467,7 +2534,19 @@ def _process_expired_htlcs():
                     f"(txid={refund_txid})"
                 )
             except Exception as e:
-                log.error(f"Auto-refund {swap_id} failed: {e}")
+                err_msg = str(e).lower()
+                # Mark permanently unrecoverable if signing fails (wrong key, no key)
+                if "signrawtransactionwithwallet failed" in err_msg or \
+                   "rejected by mempool" in err_msg:
+                    fs["btc_refund_unrecoverable"] = True
+                    fs["btc_refund_error"] = str(e)
+                    refunded_any = True  # trigger DB save
+                    log.error(
+                        f"Auto-refund {swap_id}: UNRECOVERABLE — {e} "
+                        f"({amount_sats} sats stuck, marking for admin cleanup)"
+                    )
+                else:
+                    log.error(f"Auto-refund {swap_id} failed (will retry): {e}")
 
     if candidates > 0:
         log.info(f"Auto-refund check: {candidates} candidate(s), BTC height={current_height}")
@@ -6468,170 +6547,10 @@ async def set_wallet_address(chain: str = Query(...), address: str = Query(...))
 
 
 # =============================================================================
-# PRICE FEEDS
+# PRICE FEEDS — Extracted to routes/prices.py
 # =============================================================================
-
-# Price source configuration
-price_sources_config: Dict[str, Dict[str, Any]] = {
-    "binance": {"enabled": True, "api_key": None},
-    "mexc": {"enabled": False, "api_key": None},
-    "coingecko": {"enabled": True, "api_key": None},
-    "kraken": {"enabled": False, "api_key": None},
-}
-
-@app.get("/api/rates")
-async def get_rates():
-    """Get aggregated rates from configured sources and update LP pricing."""
-    # Fetch live BTC price and update LP_CONFIG
-    btc_price = await fetch_live_btc_usdc_price()
-
-    # Also update LP_CONFIG to ensure quotes use current price
-    usdc_m1_rate = BTC_M1_FIXED_RATE / btc_price
-    LP_CONFIG["pairs"]["USDC/M1"]["rate"] = usdc_m1_rate
-
-    return {
-        "BTC": btc_price,
-        "ETH": btc_price / 28,  # Approximate ETH/BTC ratio
-        "USDC": 1.0,
-        "M1": 1.0,
-        "USDC_M1_rate": usdc_m1_rate,  # For transparency
-        "sources": ["binance"],
-        "timestamp": int(time.time()),
-    }
-
-@app.post("/api/rates/sources")
-async def update_price_sources(sources: Dict[str, Any]):
-    """Update price source configuration."""
-    for source, config in sources.items():
-        if source in price_sources_config:
-            price_sources_config[source].update(config)
-            log.info(f"Updated price source: {source}")
-
-    return {"success": True, "sources": price_sources_config}
-
-@app.get("/api/rates/sources")
-async def get_price_sources():
-    """Get price source configuration."""
-    return {"sources": price_sources_config}
-
-# =============================================================================
-# PRICE PROXY (to avoid CORS issues)
-# =============================================================================
-
-import httpx
-
-def extract_json_path(data: dict, path: str):
-    """Extract value from nested dict using dot notation path."""
-    keys = path.replace('[', '.').replace(']', '').split('.')
-    result = data
-    for key in keys:
-        if key.isdigit():
-            result = result[int(key)]
-        elif isinstance(result, dict):
-            result = result.get(key)
-        else:
-            return None
-        if result is None:
-            return None
-    return result
-
-# =============================================================================
-# LIVE PRICE FETCHING
-# =============================================================================
-
-# Cache for live prices
-_price_cache = {
-    "btc_usdc": None,
-    "last_update": 0,
-    "cache_ttl": 60,  # seconds (price doesn't move enough to matter for quotes)
-}
-
-# Reusable httpx client (avoids SSL handshake on every request)
-_httpx_client: Optional[httpx.AsyncClient] = None
-
-def _get_httpx_client() -> httpx.AsyncClient:
-    global _httpx_client
-    if _httpx_client is None or _httpx_client.is_closed:
-        _httpx_client = httpx.AsyncClient(timeout=5.0)
-    return _httpx_client
-
-async def fetch_live_btc_usdc_price():
-    """Fetch live BTC/USDC price from Binance."""
-    now = time.time()
-
-    # Use cached price if fresh
-    if (_price_cache["btc_usdc"] is not None and
-        now - _price_cache["last_update"] < _price_cache["cache_ttl"]):
-        return _price_cache["btc_usdc"]
-
-    try:
-        client = _get_httpx_client()
-        response = await asyncio.wait_for(
-            client.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDC"),
-            timeout=5.0
-        )
-        response.raise_for_status()
-        data = response.json()
-        price = float(data["price"])
-
-        # Update cache
-        _price_cache["btc_usdc"] = price
-        _price_cache["last_update"] = now
-
-        # Update LP config with new USDC/M1 rate
-        # 1 USDC = (1/BTC_USDC) * 100M M1 = 100M/BTC_USDC M1
-        usdc_m1_rate = BTC_M1_FIXED_RATE / price
-        LP_CONFIG["pairs"]["USDC/M1"]["rate"] = usdc_m1_rate
-
-        log.info(f"Price updated: BTC/USDC={price:.2f}, USDC/M1={usdc_m1_rate:.2f}")
-        return price
-    except Exception as e:
-        log.error(f"Failed to fetch live price: {e}")
-        # Return cached price or default
-        return _price_cache["btc_usdc"] or 76000.0
-
-@app.get("/api/proxy/price")
-async def proxy_price(url: str = Query(...), path: str = Query("price")):
-    """
-    Proxy price API calls to avoid CORS issues.
-    Fetches URL and extracts price using JSON path.
-    """
-    # Whitelist domains for security
-    allowed_domains = [
-        "api.binance.com",
-        "api.coingecko.com",
-        "api.kraken.com",
-        "api.coinbase.com",
-        "api.mexc.com",
-    ]
-
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    if parsed.netloc not in allowed_domains:
-        # Allow custom URLs but log them
-        log.warning(f"Price proxy request to non-whitelisted domain: {parsed.netloc}")
-
-    try:
-        client = _get_httpx_client()
-        response = await asyncio.wait_for(client.get(url), timeout=10.0)
-        response.raise_for_status()
-        data = response.json()
-
-        # Extract price using path
-        price = extract_json_path(data, path)
-
-        if price is not None:
-            return {"price": float(price), "source": parsed.netloc}
-        else:
-            return {"error": f"Could not extract price at path: {path}", "data": data}
-
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Upstream timeout")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"Upstream error: {e.response.status_code}")
-    except Exception as e:
-        log.error(f"Price proxy error: {e}")
-        raise HTTPException(500, f"Proxy error: {str(e)}")
+# Routes /api/rates, /api/rates/sources, /api/proxy/price are served by prices_router.
+# fetch_live_btc_usdc_price() is imported from routes.prices.
 
 # =============================================================================
 # SDK REAL SWAP ENDPOINTS
@@ -8864,6 +8783,85 @@ async def test_btc_htlc_claim(
 
 
 # =============================================================================
+# ADMIN ENDPOINTS (localhost-only)
+# =============================================================================
+
+def _require_local(request: Request):
+    """Guard: admin endpoints only accessible from localhost."""
+    client = request.client.host if request.client else ""
+    if client not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, "Admin endpoints are localhost-only")
+
+
+@app.get("/api/admin/stuck-swaps")
+async def admin_list_stuck(request: Request):
+    """List swaps stuck in non-terminal states for more than 1 hour."""
+    _require_local(request)
+    import time as _time
+    now = _time.time()
+    stuck = []
+    with _flowswap_lock:
+        for swap_id, fs in flowswap_db.items():
+            state = fs.get("state", "")
+            if state in TERMINAL_STATES:
+                continue
+            created = fs.get("created_at", now)
+            age_minutes = int((now - created) / 60)
+            if age_minutes >= 60:
+                stuck.append({
+                    "swap_id": swap_id,
+                    "state": state,
+                    "age_minutes": age_minutes,
+                    "direction": fs.get("direction", ""),
+                    "from_amount": fs.get("from_amount", 0),
+                    "routing_mode": fs.get("routing_mode", ""),
+                })
+    return {"stuck_swaps": stuck, "count": len(stuck)}
+
+
+@app.post("/api/admin/swap/{swap_id}/force-fail")
+async def admin_force_fail(swap_id: str, request: Request):
+    """Force a stuck swap to FAILED state and release its inventory reservation."""
+    _require_local(request)
+    with _flowswap_lock:
+        if swap_id not in flowswap_db:
+            raise HTTPException(404, f"Swap {swap_id} not found")
+        fs = flowswap_db[swap_id]
+        old_state = fs.get("state", "")
+        if old_state in TERMINAL_STATES:
+            raise HTTPException(400, f"Swap already in terminal state: {old_state}")
+        fs["state"] = FlowSwapState.FAILED.value
+        fs["error"] = f"Admin force-fail from state {old_state}"
+        _release_reservation(swap_id)
+        _save_flowswap_db()
+    log.warning(f"ADMIN: force-failed swap {swap_id} (was {old_state})")
+    return {"swap_id": swap_id, "old_state": old_state, "new_state": "failed"}
+
+
+@app.post("/api/admin/cleanup-terminal")
+async def admin_cleanup_terminal(request: Request, max_age_hours: int = 24):
+    """Bulk-archive terminal swaps older than max_age_hours."""
+    _require_local(request)
+    import time as _time
+    now = _time.time()
+    cutoff = now - (max_age_hours * 3600)
+    archived = []
+    with _flowswap_lock:
+        for swap_id, fs in list(flowswap_db.items()):
+            state = fs.get("state", "")
+            if state not in TERMINAL_STATES:
+                continue
+            created = fs.get("created_at", now)
+            if created < cutoff:
+                fs["archived"] = True
+                _release_reservation(swap_id)
+                archived.append(swap_id)
+        if archived:
+            _save_flowswap_db()
+    return {"archived": archived, "count": len(archived)}
+
+
+# =============================================================================
 # FASTAPI STARTUP/SHUTDOWN EVENTS
 # =============================================================================
 
@@ -8885,6 +8883,11 @@ async def startup_event():
         log.info("EVM private key loaded — EVM operations enabled")
     else:
         log.warning("EVM private key NOT loaded — EVM operations will fail")
+
+    # Configure price module with callback to update LP_CONFIG
+    def _on_price_update(btc_price, usdc_m1_rate):
+        LP_CONFIG["pairs"]["USDC/M1"]["rate"] = usdc_m1_rate
+    configure_prices(BTC_M1_FIXED_RATE, _on_price_update)
 
     # Fetch initial live price and update LP_CONFIG
     try:
@@ -8960,8 +8963,7 @@ async def shutdown_event():
     _save_flowswap_db()
     stop_evm_watcher()
     stop_perleg_watcher()
-    if _httpx_client and not _httpx_client.is_closed:
-        await _httpx_client.aclose()
+    await close_prices_httpx()
     log.info("Swap monitor stopped")
 
 

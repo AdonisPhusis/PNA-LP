@@ -1090,6 +1090,21 @@ class BTCHTLC3S:
                 raw_tx, utxo, redeem_script
             )
 
+        # Validate TX before broadcast (catches bad witness, wrong key, etc.)
+        import json as _json_validate
+        try:
+            test_result = self.client._call(
+                "testmempoolaccept",
+                _json_validate.dumps([signed_tx])
+            )
+            if test_result and isinstance(test_result, list) and not test_result[0].get("allowed"):
+                reason = test_result[0].get("reject-reason", "unknown")
+                raise RuntimeError(f"Refund TX rejected by mempool: {reason}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log.warning(f"testmempoolaccept check failed (proceeding anyway): {e}")
+
         refund_txid = self.client.send_raw_transaction(signed_tx)
         log.info(f"3S-HTLC refunded: txid={refund_txid}")
 
