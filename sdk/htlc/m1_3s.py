@@ -32,6 +32,8 @@ class M1HTLC3SRecord:
     expiry_height: int
     status: str                 # active, claimed, refunded
     resolve_txid: Optional[str] = None
+    has_covenant: bool = False
+    covenant_dest_address: Optional[str] = None
 
 
 class M1Htlc3S:
@@ -150,6 +152,8 @@ class M1Htlc3S:
             expiry_height=result.get("expiry_height", 0),
             status=result.get("status", "unknown"),
             resolve_txid=result.get("resolve_txid"),
+            has_covenant=result.get("has_covenant", False),
+            covenant_dest_address=result.get("covenant_dest_address"),
         )
 
     def list_htlcs(self, status: str = None) -> List[M1HTLC3SRecord]:

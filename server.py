@@ -3726,7 +3726,7 @@ def _do_lp_lock_forward(swap_id: str):
                 covenant_dest = m1_claim_address
                 log.info(f"FlowSwap {swap_id}: Covenant C3={covenant_c3[:16]}... → {covenant_dest[:16]}...")
             except Exception as e:
-                log.warning(f"FlowSwap {swap_id}: C3 computation failed ({e}), creating without covenant")
+                raise Exception(f"C3 covenant computation failed — cannot create per-leg HTLC without covenant: {e}")
         else:
             m1_claim_address = _lp_addresses.get("m1", "")
         if not m1_claim_address:
@@ -4321,8 +4321,13 @@ async def flowswap_m1_locked(swap_id: str, req: M1LockedRequest):
             if htlc_info.status != "active":
                 raise HTTPException(400, f"M1 HTLC not active: {htlc_info.status}")
 
+            # Verify covenant is present (per-leg safety: LP_IN must commit M1 to LP_OUT)
+            if not htlc_info.has_covenant:
+                raise HTTPException(400,
+                    "M1 HTLC missing covenant — LP_IN must create HTLC with OP_TEMPLATEVERIFY")
+
             log.info(f"FlowSwap {swap_id}: M1 HTLC verified on-chain — "
-                     f"amount={htlc_info.amount}, hashlocks OK, claim_address OK")
+                     f"amount={htlc_info.amount}, hashlocks OK, claim_address OK, covenant OK")
         except HTTPException:
             raise
         except Exception as e:
