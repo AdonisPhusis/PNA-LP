@@ -217,6 +217,9 @@ class FlowSwapState(Enum):
     AWAITING_USDC = "awaiting_usdc"      # /init = PLAN only (no on-chain LP commitment)
     USDC_FUNDED = "usdc_funded"          # User USDC HTLC detected on-chain, LP locking
     # LP_LOCKED reused for reverse direction
+    # Per-leg routing (multi-LP)
+    AWAITING_M1 = "awaiting_m1"          # LP_OUT waiting for M1 HTLC from LP_IN (per-leg)
+    M1_LOCKED = "m1_locked"              # LP_IN locked M1, waiting for LP_OUT to lock USDC
     # Common terminal states
     COMPLETING = "completing"            # Claims in progress
     COMPLETED = "completed"              # All legs settled

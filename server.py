@@ -2635,6 +2635,37 @@ class FlowSwapPresignRequest(BaseModel):
                         description="User's preimage (64 hex chars)")
 
 
+class LegInitRequest(BaseModel):
+    """Initialize one leg of a per-leg multi-LP swap."""
+    leg: str = Field(..., description="Leg pair: 'BTC/M1' or 'M1/USDC'")
+    from_asset: str = Field(..., description="Source asset: 'BTC' or 'M1'")
+    to_asset: str = Field(..., description="Destination asset: 'M1' or 'USDC'")
+    amount: float = Field(..., gt=0, description="Amount in from_asset units")
+    H_user: str = Field(..., min_length=64, max_length=64,
+                        description="User's hashlock SHA256(S_user)")
+    # LP_IN only (BTC→M1):
+    H_lp_other: Optional[str] = Field(None, min_length=64, max_length=64,
+                                      description="H_lp2 from LP_OUT (LP_IN only)")
+    lp_out_m1_address: Optional[str] = Field(None,
+                                             description="LP_OUT's M1 claim address (LP_IN only)")
+    # LP_OUT only (M1→USDC):
+    user_usdc_address: Optional[str] = Field(None,
+                                             description="User's EVM address for USDC (LP_OUT only)")
+
+
+class M1LockedRequest(BaseModel):
+    """Frontend notifies LP_OUT that LP_IN has locked M1 on-chain."""
+    m1_htlc_outpoint: str = Field(..., description="M1 HTLC outpoint (txid:vout)")
+    H_lp1: str = Field(..., min_length=64, max_length=64,
+                       description="LP_IN's hashlock H_lp1")
+
+
+class DeliverSecretRequest(BaseModel):
+    """Frontend delivers counterparty's secret to LP."""
+    S_lp2: str = Field(..., min_length=64, max_length=64,
+                       description="LP_OUT's secret S_lp2")
+
+
 # --- Endpoints ---
 
 @app.post("/api/flowswap/quote")
@@ -3033,6 +3064,250 @@ def _generate_ephemeral_btc_key() -> tuple:
     return wif_str, pubkey_hex
 
 
+# =============================================================================
+# PER-LEG ROUTING — Multi-LP FlowSwap Init (Blueprint 16 Phase 4)
+# =============================================================================
+
+@app.post("/api/flowswap/init-leg")
+async def flowswap_init_leg(req: LegInitRequest, request: Request = None):
+    """
+    Initialize ONE leg of a per-leg multi-LP swap.
+
+    LP_OUT (M1→USDC): generates S_lp2, returns H_lp2 + lp_m1_address.
+    LP_IN  (BTC→M1):  generates S_lp1, returns H_lp1 + btc_deposit address.
+
+    PLAN ONLY — no on-chain commitment (anti-grief).
+    """
+    import hashlib as _hl
+
+    # Validate H_user
+    try:
+        h_user_bytes = bytes.fromhex(req.H_user)
+        if len(h_user_bytes) != 32:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise HTTPException(400, "Invalid H_user: must be 64 hex chars (32 bytes)")
+
+    # Validate leg
+    valid_legs = {"BTC/M1", "M1/USDC"}
+    if req.leg not in valid_legs:
+        raise HTTPException(400, f"Invalid leg: {req.leg} (must be one of {valid_legs})")
+
+    client_ip = ""
+    if request:
+        client_ip = request.client.host if request.client else ""
+    _check_rate_limit(client_ip)
+
+    swap_id = f"fs_{uuid.uuid4().hex[:16]}"
+    now = int(time.time())
+    plan_expires_at = now + PLAN_EXPIRY_SECONDS
+
+    if req.leg == "M1/USDC":
+        # ── LP_OUT branch: M1→USDC ──
+        if not req.user_usdc_address:
+            raise HTTPException(400, "user_usdc_address required for M1/USDC leg")
+
+        # M1 amount in sats (from_asset=M1)
+        m1_amount_sats = int(req.amount)
+        if m1_amount_sats <= 0:
+            raise HTTPException(400, "Invalid M1 amount")
+
+        # Calculate USDC output
+        btc_usdc_rate = _get_btc_m1_usdc_rate()
+        if btc_usdc_rate <= 0:
+            raise HTTPException(503, "Price feed unavailable")
+        spread = LP_CONFIG["pairs"].get("BTC/USDC", {}).get("spread_bid", 0.5)
+        # M1 sats → BTC equivalent → USDC
+        usdc_amount = round((m1_amount_sats / 100_000_000) * btc_usdc_rate * (1 - spread / 100), 2)
+
+        # Generate S_lp2
+        S_lp2 = secrets.token_hex(32)
+        H_lp2 = _hl.sha256(bytes.fromhex(S_lp2)).hexdigest()
+
+        # LP_OUT's M1 address (where M1 will be routed via claim_address)
+        lp_m1_address = _lp_addresses.get("m1", "")
+        if not lp_m1_address:
+            raise HTTPException(503, "LP M1 address not configured")
+
+        log.info(f"FlowSwap init-leg {swap_id}: LP_OUT M1→USDC, {m1_amount_sats} sats → {usdc_amount} USDC")
+
+        flowswap_db[swap_id] = {
+            "swap_id": swap_id,
+            "state": FlowSwapState.AWAITING_M1.value,
+            "is_perleg": True,
+            "leg": "M1/USDC",
+            "from_asset": "M1",
+            "to_asset": "USDC",
+            "direction": "forward",
+            "m1_amount_sats": m1_amount_sats,
+            "usdc_amount": usdc_amount,
+            "spread_applied": spread,
+            # Secret (LP_OUT generates S_lp2 only)
+            "S_lp2": S_lp2,
+            "H_user": req.H_user,
+            "H_lp2": H_lp2,
+            "H_lp1": None,  # Populated when m1-locked is called
+            # M1 leg (populated when LP_IN locks)
+            "m1_htlc_outpoint": None,
+            "m1_htlc_txid": None,
+            # EVM leg (populated when LP_OUT locks USDC)
+            "evm_htlc_id": None,
+            "evm_lock_txhash": None,
+            "evm_claim_txhash": None,
+            # User info
+            "user_usdc_address": req.user_usdc_address,
+            # Cross-reference
+            "lp_in_swap_id": None,
+            # Anti-grief
+            "plan_expires_at": plan_expires_at,
+            "client_ip": client_ip,
+            "lp_locked_at": None,
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+        }
+        _save_flowswap_db()
+
+        return {
+            "swap_id": swap_id,
+            "state": FlowSwapState.AWAITING_M1.value,
+            "leg": "M1/USDC",
+            "lp_id": LP_CONFIG["id"],
+            "lp_name": LP_CONFIG["name"],
+            "H_lp2": H_lp2,
+            "lp_m1_address": lp_m1_address,
+            "usdc_output": {
+                "amount": usdc_amount,
+                "recipient": req.user_usdc_address,
+            },
+            "plan_expires_at": plan_expires_at,
+            "message": "LP_OUT plan created. Waiting for LP_IN to lock M1.",
+        }
+
+    else:
+        # ── LP_IN branch: BTC→M1 ──
+        if not req.H_lp_other:
+            raise HTTPException(400, "H_lp_other (H_lp2 from LP_OUT) required for BTC/M1 leg")
+        if not req.lp_out_m1_address:
+            raise HTTPException(400, "lp_out_m1_address required for BTC/M1 leg")
+
+        # Validate H_lp_other
+        try:
+            h_other_bytes = bytes.fromhex(req.H_lp_other)
+            if len(h_other_bytes) != 32:
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise HTTPException(400, "Invalid H_lp_other: must be 64 hex chars")
+
+        btc_amount_sats = int(req.amount * 100_000_000)
+        m1_amount_sats = btc_amount_sats  # 1:1 BTC/M1
+
+        if btc_amount_sats < MIN_SWAP_BTC_SATS:
+            raise HTTPException(400, f"Amount too small: {btc_amount_sats} sats (min {MIN_SWAP_BTC_SATS})")
+
+        # Generate S_lp1 only (LP_IN's secret)
+        S_lp1 = secrets.token_hex(32)
+        H_lp1 = _hl.sha256(bytes.fromhex(S_lp1)).hexdigest()
+
+        log.info(f"FlowSwap init-leg {swap_id}: LP_IN BTC→M1, {req.amount} BTC, lp_out={req.lp_out_m1_address[:16]}...")
+
+        # Generate BTC HTLC address (3 hashlocks: H_user + H_lp1 + H_lp2)
+        btc_3s = get_btc_htlc_3s()
+        if not btc_3s:
+            raise HTTPException(503, "BTC HTLC3S client not available")
+
+        lp_btc_key = _load_lp_btc_key()
+        lp_refund_pubkey = lp_btc_key.get("pubkey", "")
+        lp1_claim_pubkey = lp_refund_pubkey
+        lp1_claim_wif = lp_btc_key.get("claim_wif", "")
+        if not lp_refund_pubkey:
+            raise HTTPException(503, "LP BTC key not configured")
+
+        try:
+            btc_htlc = btc_3s.create_htlc_3s(
+                amount_sats=btc_amount_sats,
+                H_user=req.H_user,
+                H_lp1=H_lp1,
+                H_lp2=req.H_lp_other,  # LP_OUT's hashlock
+                recipient_pubkey=lp1_claim_pubkey,
+                refund_pubkey=lp_refund_pubkey,
+                timeout_blocks=FLOWSWAP_TIMELOCK_BTC_BLOCKS,
+            )
+        except Exception as e:
+            log.error(f"FlowSwap init-leg {swap_id}: BTC HTLC generation failed: {e}")
+            raise HTTPException(500, f"Failed to generate BTC HTLC: {e}")
+
+        log.info(f"FlowSwap init-leg {swap_id}: BTC HTLC address={btc_htlc['htlc_address']}")
+
+        flowswap_db[swap_id] = {
+            "swap_id": swap_id,
+            "state": FlowSwapState.AWAITING_BTC.value,
+            "is_perleg": True,
+            "leg": "BTC/M1",
+            "from_asset": "BTC",
+            "to_asset": "M1",
+            "direction": "forward",
+            "btc_amount_sats": btc_amount_sats,
+            "m1_amount_sats": m1_amount_sats,
+            "spread_applied": 0,  # Spread applied on LP_OUT side
+            # Secret (LP_IN generates S_lp1 only)
+            "S_lp1": S_lp1,
+            "lp1_claim_wif": lp1_claim_wif,
+            "H_user": req.H_user,
+            "H_lp1": H_lp1,
+            "H_lp2": req.H_lp_other,  # From LP_OUT
+            # S_lp2 received later via /deliver-secret
+            "S_lp_received": None,
+            # Per-leg routing
+            "lp_out_m1_address": req.lp_out_m1_address,
+            "lp_out_swap_id": None,
+            # BTC leg
+            "btc_htlc_address": btc_htlc["htlc_address"],
+            "btc_redeem_script": btc_htlc["redeem_script"],
+            "btc_timelock": btc_htlc["timelock"],
+            "btc_fund_txid": None,
+            "btc_claim_txid": None,
+            # M1 leg (populated after LP_IN locks)
+            "m1_htlc_outpoint": None,
+            "m1_htlc_txid": None,
+            # Anti-grief
+            "plan_expires_at": plan_expires_at,
+            "client_ip": client_ip,
+            "lp_locked_at": None,
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+        }
+        _save_flowswap_db()
+
+        return {
+            "swap_id": swap_id,
+            "state": FlowSwapState.AWAITING_BTC.value,
+            "leg": "BTC/M1",
+            "lp_id": LP_CONFIG["id"],
+            "lp_name": LP_CONFIG["name"],
+            "H_lp1": H_lp1,
+            "btc_deposit": {
+                "address": btc_htlc["htlc_address"],
+                "amount_sats": btc_amount_sats,
+                "amount_btc": f"{btc_amount_sats / 100_000_000:.8f}",
+                "timelock_blocks": btc_htlc["timelock"],
+                "instant_min_feerate": _get_instant_min_feerate(),
+            },
+            "hashlocks": {
+                "H_user": req.H_user,
+                "H_lp1": H_lp1,
+                "H_lp2": req.H_lp_other,
+            },
+            "timelocks": {
+                "btc_blocks": FLOWSWAP_TIMELOCK_BTC_BLOCKS,
+                "m1_blocks": FLOWSWAP_TIMELOCK_M1_BLOCKS,
+            },
+            "plan_expires_at": plan_expires_at,
+            "message": "LP_IN plan created. Fund BTC address, then POST /api/flowswap/{id}/btc-funded.",
+        }
+
+
 def _do_lp_lock_forward(swap_id: str):
     """
     Background: LP locks M1 (BATHRON) + USDC (EVM) after user's BTC is confirmed.
@@ -3120,9 +3395,15 @@ def _do_lp_lock_forward(swap_id: str):
         if not m1_3s:
             raise Exception("M1 HTLC3S client not available")
 
-        lp_m1_address = _lp_addresses.get("m1", "")
-        if not lp_m1_address:
-            raise Exception("LP M1 address not configured — cannot create HTLC")
+        # Per-leg: M1 claim_address → LP_OUT (not self)
+        is_perleg = fs.get("is_perleg", False)
+        if is_perleg and fs.get("lp_out_m1_address"):
+            m1_claim_address = fs["lp_out_m1_address"]
+            log.info(f"FlowSwap {swap_id}: Per-leg mode — M1 claim_address → LP_OUT: {m1_claim_address[:16]}...")
+        else:
+            m1_claim_address = _lp_addresses.get("m1", "")
+        if not m1_claim_address:
+            raise Exception("M1 claim address not configured — cannot create HTLC")
 
         receipt_outpoint = m1_3s.ensure_receipt_available(fs["m1_amount_sats"])
         m1_result = m1_3s.create_htlc(
@@ -3130,7 +3411,7 @@ def _do_lp_lock_forward(swap_id: str):
             H_user=fs["H_user"],
             H_lp1=fs["H_lp1"],
             H_lp2=fs["H_lp2"],
-            claim_address=lp_m1_address,
+            claim_address=m1_claim_address,
             expiry_blocks=FLOWSWAP_TIMELOCK_M1_BLOCKS,
         )
 
@@ -3138,6 +3419,16 @@ def _do_lp_lock_forward(swap_id: str):
             fs["m1_htlc_outpoint"] = m1_result.get("htlc_outpoint")
             fs["m1_htlc_txid"] = m1_result.get("txid")
         log.info(f"FlowSwap {swap_id}: M1 locked, outpoint={m1_result.get('htlc_outpoint')}")
+
+        # Per-leg: LP_IN only locks M1, not USDC (LP_OUT handles USDC)
+        if is_perleg:
+            with _flowswap_lock:
+                fs["state"] = FlowSwapState.M1_LOCKED.value
+                fs["updated_at"] = int(time.time())
+                fs.pop("_lp_locking", None)
+                _save_flowswap_db()
+            log.info(f"FlowSwap {swap_id}: M1_LOCKED (per-leg, waiting for LP_OUT to lock USDC)")
+            return  # LP_OUT will lock USDC via /m1-locked endpoint
 
         # Re-check BTC TX before committing USDC (most expensive leg)
         if btc_3s and fs.get("btc_fund_txid"):
@@ -3629,6 +3920,138 @@ async def flowswap_btc_funded(swap_id: str):
     }
 
 
+# =============================================================================
+# PER-LEG: m1-locked (LP_OUT receives M1 info, locks USDC, returns S_lp2)
+# =============================================================================
+
+@app.post("/api/flowswap/{swap_id}/m1-locked")
+async def flowswap_m1_locked(swap_id: str, req: M1LockedRequest):
+    """
+    Frontend notifies LP_OUT that LP_IN has locked M1 on BATHRON chain.
+    LP_OUT verifies M1 HTLC, locks USDC, and returns S_lp2.
+    """
+    if swap_id not in flowswap_db:
+        raise HTTPException(404, "FlowSwap not found")
+
+    fs = flowswap_db[swap_id]
+
+    if not fs.get("is_perleg"):
+        raise HTTPException(400, "Not a per-leg swap")
+    if fs.get("leg") != "M1/USDC":
+        raise HTTPException(400, "m1-locked only applies to LP_OUT (M1/USDC leg)")
+    if fs["state"] != FlowSwapState.AWAITING_M1.value:
+        raise HTTPException(400, f"Invalid state: {fs['state']} (expected awaiting_m1)")
+
+    # Store H_lp1 and M1 HTLC outpoint
+    with _flowswap_lock:
+        fs["H_lp1"] = req.H_lp1
+        fs["m1_htlc_outpoint"] = req.m1_htlc_outpoint
+        fs["m1_htlc_txid"] = req.m1_htlc_outpoint.split(":")[0] if ":" in req.m1_htlc_outpoint else req.m1_htlc_outpoint
+        fs["updated_at"] = int(time.time())
+        _save_flowswap_db()
+
+    log.info(f"FlowSwap {swap_id}: m1-locked received, outpoint={req.m1_htlc_outpoint}, H_lp1={req.H_lp1[:16]}...")
+
+    # TODO: Verify M1 HTLC on BATHRON chain (amount, hashlocks, claim_address)
+    # For testnet, we trust the frontend relay. Production: verify via RPC.
+
+    # Lock USDC on EVM
+    evm_htlc = get_evm_htlc_3s()
+    if not evm_htlc:
+        raise HTTPException(503, "EVM HTLC3S client not available")
+
+    evm_privkey = _load_evm_private_key()
+    if not evm_privkey:
+        raise HTTPException(503, "EVM private key not configured")
+
+    try:
+        evm_result = evm_htlc.create_htlc(
+            recipient=fs["user_usdc_address"],
+            amount_usdc=fs["usdc_amount"],
+            H_user=fs["H_user"],
+            H_lp1=req.H_lp1,
+            H_lp2=fs["H_lp2"],
+            timelock_seconds=FLOWSWAP_TIMELOCK_USDC_SECONDS,
+            private_key=evm_privkey,
+        )
+        if not evm_result.success:
+            raise Exception(f"USDC lock failed: {evm_result.error}")
+    except Exception as e:
+        log.error(f"FlowSwap {swap_id}: LP_OUT USDC lock failed: {e}")
+        with _flowswap_lock:
+            fs["state"] = FlowSwapState.FAILED.value
+            fs["error"] = str(e)
+            fs["updated_at"] = int(time.time())
+            _save_flowswap_db()
+        raise HTTPException(500, f"USDC lock failed: {e}")
+
+    # Success → LP_LOCKED + return S_lp2 (safe: USDC is now locked)
+    with _flowswap_lock:
+        fs["evm_htlc_id"] = evm_result.htlc_id
+        fs["evm_lock_txhash"] = evm_result.tx_hash
+        fs["state"] = FlowSwapState.LP_LOCKED.value
+        fs["lp_locked_at"] = int(time.time())
+        fs["updated_at"] = int(time.time())
+        _save_flowswap_db()
+
+    log.info(f"FlowSwap {swap_id}: LP_OUT USDC locked, returning S_lp2")
+
+    return {
+        "swap_id": swap_id,
+        "state": FlowSwapState.LP_LOCKED.value,
+        "evm_htlc_id": evm_result.htlc_id,
+        "evm_lock_txhash": evm_result.tx_hash,
+        # Secret exchange: LP_OUT shares S_lp2 after committing USDC
+        "S_lp2": fs["S_lp2"],
+        "message": "USDC locked. S_lp2 delivered. Forward to LP_IN via /deliver-secret.",
+    }
+
+
+# =============================================================================
+# PER-LEG: deliver-secret (LP_IN receives S_lp2 from frontend relay)
+# =============================================================================
+
+@app.post("/api/flowswap/{swap_id}/deliver-secret")
+async def flowswap_deliver_secret(swap_id: str, req: DeliverSecretRequest):
+    """
+    Frontend delivers LP_OUT's secret (S_lp2) to LP_IN.
+    LP_IN verifies SHA256(S_lp2) == H_lp2, stores it, transitions to LP_LOCKED.
+    """
+    if swap_id not in flowswap_db:
+        raise HTTPException(404, "FlowSwap not found")
+
+    fs = flowswap_db[swap_id]
+
+    if not fs.get("is_perleg"):
+        raise HTTPException(400, "Not a per-leg swap")
+    if fs.get("leg") != "BTC/M1":
+        raise HTTPException(400, "deliver-secret only applies to LP_IN (BTC/M1 leg)")
+    if fs["state"] != FlowSwapState.M1_LOCKED.value:
+        raise HTTPException(400, f"Invalid state: {fs['state']} (expected m1_locked)")
+
+    # Verify SHA256(S_lp2) == H_lp2
+    import hashlib as _hl
+    computed_h = _hl.sha256(bytes.fromhex(req.S_lp2)).hexdigest()
+    if computed_h != fs["H_lp2"]:
+        raise HTTPException(400, "S_lp2 does not match H_lp2")
+
+    # Store and transition
+    with _flowswap_lock:
+        fs["S_lp_received"] = req.S_lp2
+        fs["state"] = FlowSwapState.LP_LOCKED.value
+        fs["lp_locked_at"] = int(time.time())
+        fs["updated_at"] = int(time.time())
+        _save_flowswap_db()
+
+    log.info(f"FlowSwap {swap_id}: S_lp2 received and verified, state → LP_LOCKED (ready for presign)")
+
+    return {
+        "swap_id": swap_id,
+        "state": FlowSwapState.LP_LOCKED.value,
+        "message": "Secret received. LP_IN ready for presign.",
+    }
+
+
 @app.post("/api/flowswap/{swap_id}/presign")
 async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
     """
@@ -3691,7 +4114,8 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
             secrets=HTLC3SSecrets(
                 S_user=req.S_user,
                 S_lp1=fs["S_lp1"],
-                S_lp2=fs["S_lp2"],
+                # Per-leg: S_lp2 received from LP_OUT via /deliver-secret
+                S_lp2=fs.get("S_lp_received") or fs["S_lp2"],
             ),
             recipient_address=lp1_btc_address,
             claim_privkey_wif=lp1_claim_wif,
