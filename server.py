@@ -253,6 +253,29 @@ class QuoteResponse(BaseModel):
     min_amount: float
     max_amount: float
 
+class LegQuoteResponse(BaseModel):
+    """Quote for a single leg (X→M1 or M1→Y) — used by per-leg routing."""
+    lp_id: str
+    lp_name: str
+    leg: str                         # e.g. "BTC/M1" or "M1/USDC"
+    from_asset: str
+    to_asset: str
+    from_amount: float
+    to_amount: float
+    rate: float                      # Effective rate after spread
+    rate_market: float               # Market rate before spread
+    spread_percent: float
+    inventory_ok: bool = True
+    settlement_time_seconds: int
+    settlement_time_human: str
+    confirmations_required: int
+    confirmations_breakdown: dict
+    min_amount: float
+    max_amount: float
+    valid_until: int
+    valid_seconds: int = 60
+    H_lp: str = ""                   # Hashlock placeholder (Phase 4)
+
 class SwapCreateRequest(BaseModel):
     from_asset: str = Field(..., example="BTC")
     to_asset: str = Field(..., example="USDC")
@@ -675,6 +698,112 @@ async def get_quote(
         inventory_ok=inventory_ok,
         min_amount=min_amount,
         max_amount=max_amount,
+    )
+
+@app.get("/api/quote/leg", response_model=LegQuoteResponse)
+async def get_quote_leg(
+    from_asset: str = Query(..., alias="from"),
+    to_asset: str = Query(..., alias="to"),
+    amount: float = Query(..., gt=0),
+):
+    """
+    Quote a single leg of a swap (X→M1 or M1→Y).
+
+    Used by the pna-swap Router to compose per-leg routes across
+    multiple LPs. Only M1 legs are supported — reject BTC/USDC.
+    """
+    if from_asset not in ASSETS:
+        raise HTTPException(400, f"Unknown asset: {from_asset}")
+    if to_asset not in ASSETS:
+        raise HTTPException(400, f"Unknown asset: {to_asset}")
+    if from_asset == to_asset:
+        raise HTTPException(400, "Cannot quote same asset")
+    if "M1" not in (from_asset, to_asset):
+        raise HTTPException(400, "Leg quote requires one side to be M1")
+
+    # Fetch live price
+    await fetch_live_btc_usdc_price()
+
+    # Calculate rate for the 4 valid M1 legs
+    if from_asset == "BTC" and to_asset == "M1":
+        market_rate = float(BTC_M1_FIXED_RATE)
+        spread_percent = LP_CONFIG["pairs"]["BTC/M1"]["spread_bid"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = LP_CONFIG["pairs"]["BTC/M1"]["min"]
+        max_amount = LP_CONFIG["pairs"]["BTC/M1"]["max"]
+
+    elif from_asset == "M1" and to_asset == "BTC":
+        market_rate = 1.0 / float(BTC_M1_FIXED_RATE)
+        spread_percent = LP_CONFIG["pairs"]["BTC/M1"]["spread_ask"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = LP_CONFIG["pairs"]["BTC/M1"]["min"] * BTC_M1_FIXED_RATE
+        max_amount = LP_CONFIG["pairs"]["BTC/M1"]["max"] * BTC_M1_FIXED_RATE
+
+    elif from_asset == "USDC" and to_asset == "M1":
+        market_rate = LP_CONFIG["pairs"]["USDC/M1"]["rate"]
+        spread_percent = LP_CONFIG["pairs"]["USDC/M1"]["spread_bid"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = LP_CONFIG["pairs"]["USDC/M1"]["min"]
+        max_amount = LP_CONFIG["pairs"]["USDC/M1"]["max"]
+
+    elif from_asset == "M1" and to_asset == "USDC":
+        market_rate = 1.0 / LP_CONFIG["pairs"]["USDC/M1"]["rate"]
+        spread_percent = LP_CONFIG["pairs"]["USDC/M1"]["spread_ask"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = LP_CONFIG["pairs"]["USDC/M1"]["min"] * LP_CONFIG["pairs"]["USDC/M1"]["rate"]
+        max_amount = LP_CONFIG["pairs"]["USDC/M1"]["max"] * LP_CONFIG["pairs"]["USDC/M1"]["rate"]
+
+    else:
+        raise HTTPException(400, f"Unsupported leg: {from_asset}/{to_asset}")
+
+    # Calculate output
+    to_amount = round(amount * effective_rate, ASSETS[to_asset]["decimals"])
+
+    # Check inventory
+    with _flowswap_lock:
+        available = _get_available_inventory()
+    inventory_ok = True
+    to_amount_coins = to_amount / (10 ** ASSETS[to_asset]["decimals"])
+    if to_asset == "BTC":
+        inventory_ok = available.get("btc", 0) >= to_amount_coins
+    elif to_asset == "M1":
+        inventory_ok = available.get("m1", 0) >= to_amount_coins
+    elif to_asset == "USDC":
+        inventory_ok = available.get("usdc", 0) >= to_amount_coins
+
+    # Check limits
+    if amount < min_amount:
+        raise HTTPException(400, f"Amount below minimum: {min_amount} {from_asset}")
+    if amount > max_amount:
+        raise HTTPException(400, f"Amount above maximum: {max_amount} {from_asset}")
+
+    # Settlement time
+    settlement_seconds, conf_required, conf_breakdown = get_settlement_time(
+        from_asset, to_asset, amount
+    )
+    valid_seconds = 60
+
+    return LegQuoteResponse(
+        lp_id=LP_CONFIG["id"],
+        lp_name=LP_CONFIG["name"],
+        leg=f"{from_asset}/{to_asset}",
+        from_asset=from_asset,
+        to_asset=to_asset,
+        from_amount=amount,
+        to_amount=to_amount,
+        rate=effective_rate,
+        rate_market=market_rate,
+        spread_percent=spread_percent,
+        inventory_ok=inventory_ok,
+        settlement_time_seconds=settlement_seconds,
+        settlement_time_human=human_time(settlement_seconds),
+        confirmations_required=conf_required,
+        confirmations_breakdown=conf_breakdown,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        valid_until=int(time.time()) + valid_seconds,
+        valid_seconds=valid_seconds,
+        H_lp="",
     )
 
 @app.post("/api/swap/create", response_model=SwapCreateResponse)
