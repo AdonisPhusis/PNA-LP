@@ -2666,6 +2666,16 @@ class DeliverSecretRequest(BaseModel):
                        description="LP_OUT's secret S_lp2")
 
 
+class BtcClaimedRequest(BaseModel):
+    """Notify LP_OUT that LP_IN claimed BTC (per-leg completion)."""
+    btc_claim_txid: str = Field(..., min_length=64, max_length=64,
+                                description="LP_IN's BTC claim transaction ID")
+    S_user: str = Field(..., min_length=64, max_length=64,
+                        description="User's secret (revealed on BTC chain)")
+    S_lp1: str = Field(..., min_length=64, max_length=64,
+                       description="LP_IN's secret (revealed on BTC chain)")
+
+
 # --- Endpoints ---
 
 @app.post("/api/flowswap/quote")
@@ -4228,6 +4238,17 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
                         _save_flowswap_db()
                     return
 
+            # ── Per-leg: LP_IN only claimed BTC. USDC + M1 are LP_OUT's job. ──
+            if fs.get("is_perleg"):
+                with _flowswap_lock:
+                    fs["state"] = FlowSwapState.COMPLETED.value
+                    fs["completed_at"] = int(time.time())
+                    fs["updated_at"] = int(time.time())
+                    _release_reservation(swap_id)
+                    _save_flowswap_db()
+                log.info(f"FlowSwap {swap_id}: COMPLETED (per-leg LP_IN — USDC+M1 handled by LP_OUT)")
+                return
+
             # ── Claim USDC on EVM (only AFTER BTC claim is confirmed) ──
             if not fs.get("evm_claim_txhash"):
                 evm = get_evm_htlc_3s()
@@ -4310,13 +4331,18 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
     fs["state"] = FlowSwapState.COMPLETING.value
     threading.Thread(target=_complete_swap, daemon=True).start()
 
-    return {
+    response = {
         "swap_id": swap_id,
         "state": FlowSwapState.COMPLETING.value,
         "btc_claim_txid": btc_claim_txid,
         "message": "BTC claimed. USDC + M1 claims in progress (auto-completing).",
         "next_step": f"Poll GET /api/flowswap/{swap_id} for completion",
     }
+    # Per-leg: expose S_lp1 so frontend can relay it to LP_OUT.
+    # Not a secret leak — S_lp1 is already public on the BTC chain (claim TX).
+    if fs.get("is_perleg"):
+        response["S_lp1"] = fs["S_lp1"]
+    return response
 
 
 async def _presign_reverse(swap_id: str, fs: Dict, req: FlowSwapPresignRequest):
@@ -4489,6 +4515,234 @@ async def _presign_reverse(swap_id: str, fs: Dict, req: FlowSwapPresignRequest):
         "state": FlowSwapState.COMPLETING.value,
         "message": "Claiming USDC + BTC (for user) + M1. Auto-completing.",
         "btc_destination": fs.get("user_btc_address", ""),
+        "next_step": f"Poll GET /api/flowswap/{swap_id} for completion",
+    }
+
+
+# =============================================================================
+# PER-LEG COMPLETION: LP_OUT receives secrets after LP_IN claims BTC
+# =============================================================================
+
+@app.post("/api/flowswap/{swap_id}/btc-claimed")
+async def flowswap_btc_claimed(swap_id: str, req: BtcClaimedRequest):
+    """
+    Per-leg completion: frontend notifies LP_OUT that LP_IN claimed BTC.
+
+    LP_OUT receives the revealed secrets (S_user, S_lp1 — now public on BTC chain)
+    and launches a background thread to claim USDC (for user) and M1 (for self).
+    """
+    if swap_id not in flowswap_db:
+        raise HTTPException(404, "FlowSwap not found")
+
+    fs = flowswap_db[swap_id]
+
+    # Only valid for per-leg LP_OUT swaps
+    if not fs.get("is_perleg"):
+        raise HTTPException(400, "Not a per-leg swap")
+
+    if fs.get("leg") != "M1/USDC":
+        raise HTTPException(400, f"This endpoint is for LP_OUT (M1/USDC leg), got leg={fs.get('leg')}")
+
+    # Accept from lp_locked state (LP_OUT locked USDC+M1, waiting for BTC claim proof)
+    if fs["state"] != FlowSwapState.LP_LOCKED.value:
+        raise HTTPException(400, f"Invalid state: {fs['state']} (expected lp_locked)")
+
+    # Verify secrets match the stored hashes
+    computed_H_user = hashlib.sha256(bytes.fromhex(req.S_user)).hexdigest()
+    if computed_H_user != fs["H_user"]:
+        raise HTTPException(400, "S_user does not match H_user")
+
+    computed_H_lp1 = hashlib.sha256(bytes.fromhex(req.S_lp1)).hexdigest()
+    if computed_H_lp1 != fs.get("H_lp1"):
+        raise HTTPException(400, "S_lp1 does not match H_lp1")
+
+    # Store secrets + BTC claim txid
+    with _flowswap_lock:
+        fs["S_user"] = req.S_user
+        fs["S_lp1"] = req.S_lp1
+        fs["btc_claim_txid"] = req.btc_claim_txid
+        fs["state"] = FlowSwapState.BTC_CLAIMED.value
+        fs["updated_at"] = int(time.time())
+        _save_flowswap_db()
+
+    log.info(f"FlowSwap {swap_id}: LP_OUT received BTC claim proof, btc_txid={req.btc_claim_txid[:16]}...")
+
+    # Launch LP_OUT completion thread
+    def _complete_lp_out():
+        """LP_OUT completion: wait for BTC claim confirmation, then claim USDC + M1."""
+        try:
+            btc_claim_txid_local = fs.get("btc_claim_txid", "")
+
+            # ── GATE: Wait for BTC claim TX confirmation (same RBF gate as single-LP) ──
+            if btc_claim_txid_local and BTC_CLAIM_MIN_CONFIRMATIONS > 0:
+                btc_3s_gate = get_btc_htlc_3s()
+                if not btc_3s_gate:
+                    log.error(
+                        f"FlowSwap {swap_id}: LP_OUT BTC client unavailable — "
+                        f"REFUSING to release USDC (fail-closed)."
+                    )
+                    with _flowswap_lock:
+                        fs["state"] = FlowSwapState.FAILED.value
+                        fs["error"] = (
+                            "BTC client unavailable. Cannot verify BTC claim "
+                            "confirmation. USDC NOT released (fail-closed)."
+                        )
+                        fs["updated_at"] = int(time.time())
+                        _release_reservation(swap_id)
+                        _save_flowswap_db()
+                    return
+
+                poll_start = time.time()
+                poll_interval = 15
+                confirmed = False
+
+                log.info(
+                    f"FlowSwap {swap_id}: LP_OUT GATING — waiting for BTC claim "
+                    f"{btc_claim_txid_local[:16]}... to reach "
+                    f"{BTC_CLAIM_MIN_CONFIRMATIONS} conf(s) "
+                    f"(timeout={BTC_CLAIM_CONFIRMATION_TIMEOUT}s)"
+                )
+
+                while time.time() - poll_start < BTC_CLAIM_CONFIRMATION_TIMEOUT:
+                    try:
+                        tx_info = btc_3s_gate.client._call(
+                            "getrawtransaction", btc_claim_txid_local, True
+                        )
+                        confs = tx_info.get("confirmations", 0) if tx_info else 0
+
+                        with _flowswap_lock:
+                            fs["btc_claim_confs"] = confs
+                            fs["updated_at"] = int(time.time())
+                            _save_flowswap_db()
+
+                        if confs >= BTC_CLAIM_MIN_CONFIRMATIONS:
+                            log.info(
+                                f"FlowSwap {swap_id}: LP_OUT BTC claim CONFIRMED "
+                                f"({confs} conf(s)). Proceeding to USDC+M1 claims."
+                            )
+                            confirmed = True
+                            break
+
+                        elapsed = int(time.time() - poll_start)
+                        log.info(
+                            f"FlowSwap {swap_id}: LP_OUT BTC claim confs={confs}/"
+                            f"{BTC_CLAIM_MIN_CONFIRMATIONS}, elapsed={elapsed}s"
+                        )
+                    except Exception as e:
+                        log.warning(
+                            f"FlowSwap {swap_id}: LP_OUT BTC claim conf check error: {e}"
+                        )
+
+                    time.sleep(poll_interval)
+
+                if not confirmed:
+                    log.error(
+                        f"FlowSwap {swap_id}: LP_OUT BTC claim "
+                        f"{btc_claim_txid_local[:16]}... did NOT confirm within "
+                        f"{BTC_CLAIM_CONFIRMATION_TIMEOUT}s. "
+                        f"REFUSING to release USDC."
+                    )
+                    with _flowswap_lock:
+                        fs["state"] = FlowSwapState.FAILED.value
+                        fs["error"] = (
+                            "BTC claim TX did not confirm in time. "
+                            "USDC NOT released. LP recovers via HTLC timelock."
+                        )
+                        fs["updated_at"] = int(time.time())
+                        _release_reservation(swap_id)
+                        _save_flowswap_db()
+                    return
+
+            # ── Claim USDC on EVM for user (LP_OUT has evm_htlc_id) ──
+            if not fs.get("evm_claim_txhash"):
+                evm = get_evm_htlc_3s()
+                evm_privkey = _load_evm_private_key()
+                if evm and evm_privkey and fs.get("evm_htlc_id"):
+                    evm_result = evm.claim_htlc(
+                        htlc_id=fs["evm_htlc_id"],
+                        S_user=fs["S_user"],
+                        S_lp1=fs["S_lp1"],
+                        S_lp2=fs["S_lp2"],
+                        private_key=evm_privkey,
+                    )
+                    if evm_result.success:
+                        with _flowswap_lock:
+                            fs["evm_claim_txhash"] = evm_result.tx_hash
+                            fs["updated_at"] = int(time.time())
+                            _save_flowswap_db()
+                        log.info(f"FlowSwap {swap_id}: LP_OUT USDC claimed, tx={evm_result.tx_hash}")
+                    else:
+                        log.error(f"FlowSwap {swap_id}: LP_OUT USDC claim failed: {evm_result.error}")
+                else:
+                    log.error(f"FlowSwap {swap_id}: LP_OUT cannot claim USDC — missing evm client/key/htlc_id")
+            else:
+                log.info(f"FlowSwap {swap_id}: LP_OUT USDC already claimed, skipping")
+
+            # ── Claim M1 on BATHRON for LP_OUT (LP_OUT's own M1) ──
+            m1_claimed = True
+            if not fs.get("m1_claim_txid"):
+                m1_3s = get_m1_htlc_3s()
+                if m1_3s:
+                    m1_claimed = False
+                    for attempt in range(12):  # up to 2 minutes
+                        try:
+                            m1_result = m1_3s.claim(
+                                htlc_outpoint=fs["m1_htlc_outpoint"],
+                                S_user=fs["S_user"],
+                                S_lp1=fs["S_lp1"],
+                                S_lp2=fs["S_lp2"],
+                            )
+                            with _flowswap_lock:
+                                fs["m1_claim_txid"] = m1_result.get("txid")
+                                fs["updated_at"] = int(time.time())
+                                _save_flowswap_db()
+                            log.info(f"FlowSwap {swap_id}: LP_OUT M1 claimed, txid={m1_result.get('txid')}")
+                            m1_claimed = True
+                            break
+                        except Exception as e:
+                            if "not found" in str(e).lower():
+                                log.info(f"FlowSwap {swap_id}: LP_OUT M1 HTLC not in block yet ({attempt+1}/12)")
+                            else:
+                                log.error(f"FlowSwap {swap_id}: LP_OUT M1 claim error ({attempt+1}/12): {e}")
+                            time.sleep(10)
+                    if not m1_claimed:
+                        log.error(f"FlowSwap {swap_id}: LP_OUT M1 claim failed after 12 retries")
+                else:
+                    m1_claimed = False
+                    log.error(f"FlowSwap {swap_id}: LP_OUT M1 HTLC3S manager not available")
+            else:
+                log.info(f"FlowSwap {swap_id}: LP_OUT M1 already claimed, skipping")
+
+            # Mark complete
+            with _flowswap_lock:
+                fs["state"] = FlowSwapState.COMPLETED.value
+                fs["completed_at"] = int(time.time())
+                fs["updated_at"] = int(time.time())
+                if not m1_claimed:
+                    fs["m1_claim_failed"] = True
+                _release_reservation(swap_id)
+                _save_flowswap_db()
+            log.info(f"FlowSwap {swap_id}: LP_OUT COMPLETED (m1_claimed={m1_claimed})")
+
+        except Exception as e:
+            log.error(f"FlowSwap {swap_id}: LP_OUT completion error: {e}")
+            with _flowswap_lock:
+                fs["state"] = FlowSwapState.FAILED.value
+                fs["error"] = f"LP_OUT completion error: {e}"
+                fs["updated_at"] = int(time.time())
+                _release_reservation(swap_id)
+                _save_flowswap_db()
+
+    with _flowswap_lock:
+        fs["state"] = FlowSwapState.COMPLETING.value
+        fs["updated_at"] = int(time.time())
+        _save_flowswap_db()
+    threading.Thread(target=_complete_lp_out, daemon=True).start()
+
+    return {
+        "swap_id": swap_id,
+        "state": FlowSwapState.COMPLETING.value,
+        "message": "LP_OUT completing: claiming USDC (for user) + M1 (for self).",
         "next_step": f"Poll GET /api/flowswap/{swap_id} for completion",
     }
 
