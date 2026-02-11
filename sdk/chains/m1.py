@@ -302,7 +302,9 @@ class M1Client:
 
     def htlc3s_create(self, receipt_outpoint: str, hashlock_user: str,
                       hashlock_lp1: str, hashlock_lp2: str,
-                      claim_address: str, expiry_blocks: int = 288) -> Dict:
+                      claim_address: str, expiry_blocks: int = 288,
+                      template_commitment: str = None,
+                      covenant_dest_address: str = None) -> Dict:
         """
         Lock M1 receipt in 3-secret HTLC.
 
@@ -313,13 +315,17 @@ class M1Client:
             hashlock_lp2: SHA256 hash of LP2's secret (64 hex)
             claim_address: Address that can claim with 3 preimages
             expiry_blocks: Blocks until refund (default 288)
+            template_commitment: C3 covenant hash (64 hex) for per-leg mode
+            covenant_dest_address: LP_OUT address forced by covenant
 
         Returns:
             {"txid": "...", "htlc_outpoint": "txid:0", "amount": ..., "expiry_height": ...}
         """
-        return self._call("htlc3s_create", receipt_outpoint,
-                          hashlock_user, hashlock_lp1, hashlock_lp2,
-                          claim_address, expiry_blocks)
+        args = [receipt_outpoint, hashlock_user, hashlock_lp1, hashlock_lp2,
+                claim_address, expiry_blocks]
+        if template_commitment and covenant_dest_address:
+            args.extend([template_commitment, covenant_dest_address])
+        return self._call("htlc3s_create", *args)
 
     def htlc3s_claim(self, htlc_outpoint: str, preimage_user: str,
                      preimage_lp1: str, preimage_lp2: str) -> Dict:
@@ -348,6 +354,19 @@ class M1Client:
             return self._call("htlc3s_get", htlc_outpoint)
         except RuntimeError:
             return None
+
+    def htlc3s_compute_c3(self, amount_sats: int, dest_address: str) -> Dict:
+        """
+        Compute C3 template hash for per-leg covenant.
+
+        Args:
+            amount_sats: M1 amount in sats
+            dest_address: LP_OUT destination address (P2PKH)
+
+        Returns:
+            {"template_hash": "hex", "output_amount": float, "fee": float}
+        """
+        return self._call("htlc3s_compute_c3", amount_sats, dest_address)
 
     def htlc3s_list(self, status: str = None) -> List[Dict]:
         """List 3S HTLCs, optionally filtered by status."""

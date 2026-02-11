@@ -239,6 +239,69 @@ FLOWSWAP_REV_TIMELOCK_USDC_SECONDS = 3600   # 1h (SHORTEST — user locks)
 FLOWSWAP_REV_TIMELOCK_M1_BLOCKS = 120       # 2h (MEDIUM)
 FLOWSWAP_REV_TIMELOCK_BTC_BLOCKS = 24       # 4h (LONGEST — LP funds)
 
+# Timelock cascade validation (per-leg safety invariant)
+# Forward: T_btc < T_m1 < T_usdc (claimer must have time before next refund)
+# Reverse: T_usdc < T_m1 < T_btc
+# Minimum gap between adjacent legs (seconds):
+TIMELOCK_CASCADE_MIN_GAP_SECONDS = 1800  # 30 min minimum gap
+
+
+def validate_timelock_cascade(direction: str = "forward") -> bool:
+    """Validate that timelocks form a strict cascade.
+
+    Forward (BTC→USDC): T_btc_s < T_m1_s < T_usdc_s
+    Reverse (USDC→BTC): T_usdc_s < T_m1_s < T_btc_s
+
+    Returns True if valid, raises ValueError if not.
+    """
+    btc_s = FLOWSWAP_TIMELOCK_BTC_BLOCKS * 600  # BTC block ~10min
+    m1_s = FLOWSWAP_TIMELOCK_M1_BLOCKS * 60     # M1 block ~1min
+    usdc_s = FLOWSWAP_TIMELOCK_USDC_SECONDS
+
+    if direction == "forward":
+        # User claims USDC first, LP claims M1 second, LP claims BTC third
+        # So: T_btc < T_m1 < T_usdc (shorter → expires first → claims first)
+        if not (btc_s < m1_s < usdc_s):
+            raise ValueError(
+                f"Forward timelock cascade violated: "
+                f"T_btc={btc_s}s, T_m1={m1_s}s, T_usdc={usdc_s}s "
+                f"(must be T_btc < T_m1 < T_usdc)"
+            )
+        if m1_s - btc_s < TIMELOCK_CASCADE_MIN_GAP_SECONDS:
+            raise ValueError(
+                f"Insufficient gap T_m1 - T_btc: {m1_s - btc_s}s "
+                f"(min {TIMELOCK_CASCADE_MIN_GAP_SECONDS}s)"
+            )
+        if usdc_s - m1_s < TIMELOCK_CASCADE_MIN_GAP_SECONDS:
+            raise ValueError(
+                f"Insufficient gap T_usdc - T_m1: {usdc_s - m1_s}s "
+                f"(min {TIMELOCK_CASCADE_MIN_GAP_SECONDS}s)"
+            )
+    else:
+        # Reverse: USDC < M1 < BTC
+        rev_usdc_s = FLOWSWAP_REV_TIMELOCK_USDC_SECONDS
+        rev_m1_s = FLOWSWAP_REV_TIMELOCK_M1_BLOCKS * 60
+        rev_btc_s = FLOWSWAP_REV_TIMELOCK_BTC_BLOCKS * 600
+
+        if not (rev_usdc_s < rev_m1_s < rev_btc_s):
+            raise ValueError(
+                f"Reverse timelock cascade violated: "
+                f"T_usdc={rev_usdc_s}s, T_m1={rev_m1_s}s, T_btc={rev_btc_s}s "
+                f"(must be T_usdc < T_m1 < T_btc)"
+            )
+        if rev_m1_s - rev_usdc_s < TIMELOCK_CASCADE_MIN_GAP_SECONDS:
+            raise ValueError(
+                f"Insufficient gap T_m1 - T_usdc: {rev_m1_s - rev_usdc_s}s "
+                f"(min {TIMELOCK_CASCADE_MIN_GAP_SECONDS}s)"
+            )
+        if rev_btc_s - rev_m1_s < TIMELOCK_CASCADE_MIN_GAP_SECONDS:
+            raise ValueError(
+                f"Insufficient gap T_btc - T_m1: {rev_btc_s - rev_m1_s}s "
+                f"(min {TIMELOCK_CASCADE_MIN_GAP_SECONDS}s)"
+            )
+    return True
+
+
 # =============================================================================
 # Anti-Grief Policy Constants
 # =============================================================================

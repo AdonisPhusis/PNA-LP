@@ -52,6 +52,7 @@ try:
         MAX_CONCURRENT_SWAPS_PER_SESSION, BTC_CONFIRMATION_TIERS,
         BTC_CLAIM_MIN_CONFIRMATIONS, BTC_CLAIM_CONFIRMATION_TIMEOUT,
         COMPLETING_TIMEOUT_FORWARD, COMPLETING_TIMEOUT_REVERSE,
+        validate_timelock_cascade,
     )
     from sdk.chains.btc import BTCClient, BTCConfig
     from sdk.chains.m1 import M1Client, M1Config
@@ -514,6 +515,9 @@ async def get_status():
     ]
     test_mode = all(s == 0 for s in all_spreads)
 
+    # Compute reputation score
+    reputation = _compute_lp_reputation()
+
     return {
         "status": "ok",
         "version": "0.2.0",
@@ -527,7 +531,133 @@ async def get_status():
         "flowswap_3s_total": len(flowswap_db),
         "lps_active": len(lps_db),
         "protocol_fee": 0,
+        "reputation": {
+            "score": reputation["score"],
+            "success_rate": reputation["success_rate"],
+            "total_swaps": reputation["total_swaps"],
+            "blacklisted": reputation["blacklisted"],
+        },
     }
+
+# =============================================================================
+# LP REPUTATION TRACKING
+# =============================================================================
+
+# Blacklist: LP IDs temporarily blacklisted (set by external callers or internal)
+_lp_blacklist: Dict[str, int] = {}  # lp_id → blacklisted_until (unix timestamp)
+LP_BLACKLIST_THRESHOLD = 10  # Consecutive failures before blacklist
+LP_BLACKLIST_DURATION = 3600  # 1 hour blacklist
+
+
+def _compute_lp_reputation() -> dict:
+    """Compute reputation stats from flowswap history.
+
+    Returns success/failure counts, completion rate, and score (0-100).
+    """
+    total = 0
+    completed = 0
+    failed = 0
+    refunded = 0
+    avg_completion_time = 0.0
+    completion_times = []
+
+    # Per-leg stats
+    perleg_total = 0
+    perleg_completed = 0
+    perleg_failed = 0
+
+    with _flowswap_lock:
+        for swap_id, fs in flowswap_db.items():
+            state = fs.get("state", "")
+            if state not in TERMINAL_STATES:
+                continue
+
+            total += 1
+            is_perleg = fs.get("is_perleg", False)
+            if is_perleg:
+                perleg_total += 1
+
+            if state == FlowSwapState.COMPLETED.value:
+                completed += 1
+                if is_perleg:
+                    perleg_completed += 1
+                # Track completion time
+                created_at = fs.get("created_at", 0)
+                completed_at = fs.get("completed_at", 0)
+                if created_at and completed_at and completed_at > created_at:
+                    completion_times.append(completed_at - created_at)
+            elif state == FlowSwapState.FAILED.value:
+                failed += 1
+                if is_perleg:
+                    perleg_failed += 1
+            elif state == FlowSwapState.REFUNDED.value:
+                refunded += 1
+
+    if completion_times:
+        avg_completion_time = sum(completion_times) / len(completion_times)
+
+    # Score: 100 * (completed / total), penalized by consecutive failures
+    score = 100.0
+    if total > 0:
+        success_rate = completed / total
+        score = round(success_rate * 100, 1)
+
+    # Check if LP should be blacklisted (10+ consecutive recent failures)
+    recent_failures = 0
+    with _flowswap_lock:
+        # Check last N swaps in chronological order
+        sorted_swaps = sorted(
+            flowswap_db.values(),
+            key=lambda s: s.get("updated_at", 0),
+            reverse=True
+        )
+        for fs in sorted_swaps[:20]:  # Last 20 swaps
+            state = fs.get("state", "")
+            if state == FlowSwapState.COMPLETED.value:
+                break  # Streak broken
+            if state == FlowSwapState.FAILED.value:
+                recent_failures += 1
+            else:
+                break
+
+    blacklisted = False
+    blacklist_until = _lp_blacklist.get(LP_CONFIG["id"], 0)
+    if blacklist_until > int(time.time()):
+        blacklisted = True
+    elif recent_failures >= LP_BLACKLIST_THRESHOLD:
+        # Auto-blacklist
+        until = int(time.time()) + LP_BLACKLIST_DURATION
+        _lp_blacklist[LP_CONFIG["id"]] = until
+        blacklisted = True
+        blacklist_until = until
+        log.warning(f"LP {LP_CONFIG['id']} auto-blacklisted: {recent_failures} consecutive failures")
+
+    return {
+        "lp_id": LP_CONFIG["id"],
+        "lp_name": LP_CONFIG["name"],
+        "total_swaps": total,
+        "completed": completed,
+        "failed": failed,
+        "refunded": refunded,
+        "success_rate": round(completed / total * 100, 1) if total > 0 else 100.0,
+        "score": score,
+        "avg_completion_time_s": round(avg_completion_time, 1),
+        "perleg": {
+            "total": perleg_total,
+            "completed": perleg_completed,
+            "failed": perleg_failed,
+        },
+        "recent_consecutive_failures": recent_failures,
+        "blacklisted": blacklisted,
+        "blacklist_until": blacklist_until if blacklisted else None,
+    }
+
+
+@app.get("/api/reputation")
+async def get_reputation():
+    """Get LP reputation score and stats."""
+    return _compute_lp_reputation()
+
 
 @app.get("/api/assets")
 async def get_assets():
@@ -2345,8 +2475,17 @@ def _process_expired_htlcs():
         _save_flowswap_db()
 
 
+RECOVERY_MAX_RETRIES = 3         # Max auto-retry attempts for USDC/M1 claims
+RECOVERY_RETRY_INTERVAL = 120    # Minimum seconds between retries
+
+
 def _process_stale_completing():
-    """Watchdog: fail swaps stuck in COMPLETING/BTC_CLAIMED beyond timeout.
+    """Watchdog: retry stuck USDC/M1 claims, then fail after max retries.
+
+    Enhanced recovery strategy:
+    1. If secrets are available and claims haven't completed → retry
+    2. Track retry_count per swap
+    3. After RECOVERY_MAX_RETRIES → mark FAILED + log for reputation
 
     This catches daemon threads that died silently (e.g. server restart,
     unhandled exception).  The LP recovers locked funds via HTLC timelock
@@ -2354,6 +2493,7 @@ def _process_stale_completing():
     """
     now = int(time.time())
     failed_any = False
+    retried_any = False
 
     with _flowswap_lock:
         for swap_id, fs in flowswap_db.items():
@@ -2371,26 +2511,126 @@ def _process_stale_completing():
                        else COMPLETING_TIMEOUT_REVERSE)
 
             elapsed = now - updated_at
+            if elapsed < RECOVERY_RETRY_INTERVAL:
+                continue  # Too recent — give it time
+
+            retry_count = fs.get("recovery_retry_count", 0)
+
+            # Check if claims need retrying (secrets available but claims missing)
+            has_secrets = fs.get("S_user") and (fs.get("S_lp1") or fs.get("S_lp2"))
+            needs_evm_claim = not fs.get("evm_claim_txhash") and fs.get("evm_htlc_id")
+            needs_m1_claim = not fs.get("m1_claim_txid") and fs.get("m1_htlc_outpoint")
+            can_retry = has_secrets and (needs_evm_claim or needs_m1_claim)
+
+            if can_retry and retry_count < RECOVERY_MAX_RETRIES:
+                # Attempt retry — release lock, run claims in background
+                fs["recovery_retry_count"] = retry_count + 1
+                fs["updated_at"] = now
+                retried_any = True
+
+                log.info(
+                    f"Recovery watchdog: retrying {swap_id} "
+                    f"(attempt {retry_count + 1}/{RECOVERY_MAX_RETRIES}, "
+                    f"evm={'PENDING' if needs_evm_claim else 'OK'}, "
+                    f"m1={'PENDING' if needs_m1_claim else 'OK'})"
+                )
+
+                # Launch retry in background thread
+                _launch_recovery_retry(swap_id, fs, needs_evm_claim, needs_m1_claim)
+                continue
+
+            # No retry possible or max retries exceeded
             if elapsed < timeout:
                 continue
 
-            # Swap has been stuck beyond timeout — mark FAILED
+            # Final timeout — mark FAILED
             log.warning(
                 f"Completion watchdog: {swap_id} stuck in {state} for "
-                f"{elapsed}s (timeout={timeout}s, direction={direction}). "
+                f"{elapsed}s (timeout={timeout}s, retries={retry_count}/{RECOVERY_MAX_RETRIES}). "
                 f"Marking FAILED. LP recovers via HTLC timelock refund."
             )
             fs["state"] = FlowSwapState.FAILED.value
             fs["error"] = (
-                f"Completion timeout: stuck in {state} for {elapsed}s. "
+                f"Completion timeout: stuck in {state} for {elapsed}s "
+                f"after {retry_count} retries. "
                 f"LP funds recover via HTLC timelock refund."
             )
             fs["updated_at"] = now
             _release_reservation(swap_id)
             failed_any = True
 
-        if failed_any:
+        if failed_any or retried_any:
             _save_flowswap_db()
+
+
+def _launch_recovery_retry(swap_id: str, fs: dict,
+                           needs_evm: bool, needs_m1: bool):
+    """Background: retry failed USDC and/or M1 claims."""
+    def _retry():
+        try:
+            # Retry EVM claim
+            if needs_evm and fs.get("S_user") and fs.get("evm_htlc_id"):
+                S_lp1 = fs.get("S_lp1", "")
+                S_lp2 = fs.get("S_lp2", "")
+                S_user = fs["S_user"]
+                evm = get_evm_htlc_3s()
+                evm_privkey = _load_evm_private_key()
+                if evm and evm_privkey and S_lp1 and S_lp2:
+                    evm_result = evm.claim_htlc(
+                        htlc_id=fs["evm_htlc_id"],
+                        S_user=S_user,
+                        S_lp1=S_lp1,
+                        S_lp2=S_lp2,
+                        private_key=evm_privkey,
+                    )
+                    if evm_result.success:
+                        with _flowswap_lock:
+                            fs["evm_claim_txhash"] = evm_result.tx_hash
+                            fs["updated_at"] = int(time.time())
+                            _save_flowswap_db()
+                        log.info(f"Recovery retry: {swap_id} EVM claim OK, tx={evm_result.tx_hash}")
+                    else:
+                        log.warning(f"Recovery retry: {swap_id} EVM claim failed: {evm_result.error}")
+
+            # Retry M1 claim
+            if needs_m1 and fs.get("m1_htlc_outpoint"):
+                S_user = fs.get("S_user", "")
+                S_lp1 = fs.get("S_lp1", "")
+                S_lp2 = fs.get("S_lp2", "")
+                m1_3s = get_m1_htlc_3s()
+                if m1_3s and S_user and S_lp1 and S_lp2:
+                    try:
+                        m1_result = m1_3s.claim(
+                            htlc_outpoint=fs["m1_htlc_outpoint"],
+                            S_user=S_user,
+                            S_lp1=S_lp1,
+                            S_lp2=S_lp2,
+                        )
+                        with _flowswap_lock:
+                            fs["m1_claim_txid"] = m1_result.get("txid")
+                            fs["updated_at"] = int(time.time())
+                            _save_flowswap_db()
+                        log.info(f"Recovery retry: {swap_id} M1 claim OK, txid={m1_result.get('txid')}")
+                    except Exception as e:
+                        log.warning(f"Recovery retry: {swap_id} M1 claim failed: {e}")
+
+            # Check if all claims now complete
+            evm_ok = bool(fs.get("evm_claim_txhash"))
+            m1_ok = bool(fs.get("m1_claim_txid")) or not fs.get("m1_htlc_outpoint")
+
+            if evm_ok and m1_ok:
+                with _flowswap_lock:
+                    fs["state"] = FlowSwapState.COMPLETED.value
+                    fs["completed_at"] = int(time.time())
+                    fs["updated_at"] = int(time.time())
+                    _release_reservation(swap_id)
+                    _save_flowswap_db()
+                log.info(f"Recovery retry: {swap_id} COMPLETED after retry")
+
+        except Exception as e:
+            log.error(f"Recovery retry: {swap_id} error: {e}")
+
+    threading.Thread(target=_retry, daemon=True).start()
 
 
 def _process_expired_m1_htlc3s():
@@ -2588,9 +2828,16 @@ def _startup_recover_all_swaps():
 
         elif state in (FlowSwapState.BTC_CLAIMED.value,
                        FlowSwapState.COMPLETING.value):
-            # Check on-chain state to determine if claims went through
-            _recover_completing_swap(swap_id)
-            recovered_completing += 1
+            # Per-leg LP_OUT: if secrets are present, re-launch completion thread
+            if (fs.get("is_perleg") and fs.get("leg") == "M1/USDC"
+                    and fs.get("S_user") and fs.get("S_lp1")):
+                log.info(f"Recovery: re-launching per-leg LP_OUT completion for {swap_id}")
+                _perleg_launch_completion(swap_id)
+                recovered_completing += 1
+            else:
+                # Check on-chain state to determine if claims went through
+                _recover_completing_swap(swap_id)
+                recovered_completing += 1
 
         elif state in (FlowSwapState.AWAITING_BTC.value,
                        FlowSwapState.AWAITING_USDC.value):
@@ -2658,6 +2905,11 @@ class M1LockedRequest(BaseModel):
     m1_htlc_outpoint: str = Field(..., description="M1 HTLC outpoint (txid:vout)")
     H_lp1: str = Field(..., min_length=64, max_length=64,
                        description="LP_IN's hashlock H_lp1")
+    # Optional: BTC HTLC info for per-leg watcher (LP_OUT watches BTC for auto-completion)
+    btc_htlc_address: Optional[str] = Field(None,
+                                            description="BTC HTLC address (for LP_OUT watcher)")
+    btc_redeem_script: Optional[str] = Field(None,
+                                             description="BTC HTLC redeem script hex (for secret extraction)")
 
 
 class DeliverSecretRequest(BaseModel):
@@ -2746,6 +2998,13 @@ async def flowswap_init(req: FlowSwapInitRequest, request: Request = None):
             raise ValueError()
     except (ValueError, TypeError):
         raise HTTPException(400, "Invalid H_user: must be 64 hex chars (32 bytes)")
+
+    # Enforce timelock cascade invariant before creating any swap plan
+    direction = "forward" if req.from_asset == "BTC" else "reverse"
+    try:
+        validate_timelock_cascade(direction)
+    except ValueError as e:
+        raise HTTPException(500, f"Timelock cascade misconfigured: {e}")
 
     # Get client IP for rate limiting
     client_ip = ""
@@ -3103,6 +3362,12 @@ async def flowswap_init_leg(req: LegInitRequest, request: Request = None):
     if req.leg not in valid_legs:
         raise HTTPException(400, f"Invalid leg: {req.leg} (must be one of {valid_legs})")
 
+    # Enforce timelock cascade invariant: T_btc < T_m1 < T_usdc (forward)
+    try:
+        validate_timelock_cascade("forward")
+    except ValueError as e:
+        raise HTTPException(500, f"Timelock cascade misconfigured: {e}")
+
     client_ip = ""
     if request:
         client_ip = request.client.host if request.client else ""
@@ -3400,16 +3665,68 @@ def _do_lp_lock_forward(swap_id: str):
             if not still_exists:
                 raise Exception("BTC TX disappeared from mempool (possible RBF replacement)")
 
+        # Step 0 (per-leg only): Pre-sign BTC claim TX BEFORE locking M1.
+        # If signing fails → abort. No funds locked, no risk.
+        # In segwit P2WSH, sighash covers TX structure but NOT witness
+        # secrets (S_user, S_lp1, S_lp2). So we can pre-sign now and
+        # assemble the full witness later when secrets are known.
+        is_perleg = fs.get("is_perleg", False)
+        if is_perleg and fs.get("btc_htlc_address") and fs.get("btc_redeem_script"):
+            btc_3s_presign = get_btc_htlc_3s()
+            if btc_3s_presign:
+                lp1_claim_wif = fs.get("lp1_claim_wif", "")
+                if not lp1_claim_wif:
+                    raise Exception("LP_IN claim key not available — cannot pre-sign BTC claim")
+
+                utxo = btc_3s_presign.check_htlc_funded(
+                    htlc_address=fs["btc_htlc_address"],
+                    expected_amount=fs["btc_amount_sats"],
+                    min_confirmations=0,
+                )
+                if not utxo:
+                    raise Exception("BTC HTLC UTXO not found — cannot pre-sign")
+
+                lp_btc_key = _load_lp_btc_key()
+                lp1_btc_address = lp_btc_key.get("address", _lp_addresses.get("btc", ""))
+                if not lp1_btc_address:
+                    raise Exception("LP_IN BTC address not configured — cannot pre-sign")
+
+                try:
+                    presign_data = btc_3s_presign.presign_claim_3s(
+                        utxo=utxo,
+                        redeem_script=fs["btc_redeem_script"],
+                        recipient_address=lp1_btc_address,
+                        claim_privkey_wif=lp1_claim_wif,
+                    )
+                    with _flowswap_lock:
+                        fs["btc_presign_raw_tx"] = presign_data["raw_tx"]
+                        fs["btc_presign_sig"] = presign_data["signature"]
+                        fs["btc_presign_address"] = presign_data["recipient_address"]
+                        fs["btc_presigned"] = True
+                        _save_flowswap_db()
+                    log.info(f"FlowSwap {swap_id}: BTC claim pre-signed OK — safe to lock M1")
+                except Exception as e:
+                    raise Exception(f"BTC claim pre-signing failed: {e}. Aborting before M1 lock.")
+
         # Step 1: Lock M1 on BATHRON (cheap — only M1 gas ~23 sats at risk on failure)
         m1_3s = get_m1_htlc_3s()
         if not m1_3s:
             raise Exception("M1 HTLC3S client not available")
-
-        # Per-leg: M1 claim_address → LP_OUT (not self)
-        is_perleg = fs.get("is_perleg", False)
+        covenant_c3 = None
+        covenant_dest = None
         if is_perleg and fs.get("lp_out_m1_address"):
             m1_claim_address = fs["lp_out_m1_address"]
             log.info(f"FlowSwap {swap_id}: Per-leg mode — M1 claim_address → LP_OUT: {m1_claim_address[:16]}...")
+            # Compute C3 covenant template hash (forces claim TX output → LP_OUT)
+            try:
+                c3_result = m1_3s.client.htlc3s_compute_c3(
+                    fs["m1_amount_sats"], m1_claim_address
+                )
+                covenant_c3 = c3_result.get("template_hash")
+                covenant_dest = m1_claim_address
+                log.info(f"FlowSwap {swap_id}: Covenant C3={covenant_c3[:16]}... → {covenant_dest[:16]}...")
+            except Exception as e:
+                log.warning(f"FlowSwap {swap_id}: C3 computation failed ({e}), creating without covenant")
         else:
             m1_claim_address = _lp_addresses.get("m1", "")
         if not m1_claim_address:
@@ -3423,12 +3740,18 @@ def _do_lp_lock_forward(swap_id: str):
             H_lp2=fs["H_lp2"],
             claim_address=m1_claim_address,
             expiry_blocks=FLOWSWAP_TIMELOCK_M1_BLOCKS,
+            template_commitment=covenant_c3,
+            covenant_dest_address=covenant_dest,
         )
 
         with _flowswap_lock:
             fs["m1_htlc_outpoint"] = m1_result.get("htlc_outpoint")
             fs["m1_htlc_txid"] = m1_result.get("txid")
-        log.info(f"FlowSwap {swap_id}: M1 locked, outpoint={m1_result.get('htlc_outpoint')}")
+            fs["m1_has_covenant"] = m1_result.get("has_covenant", False)
+            if covenant_c3:
+                fs["m1_covenant_c3"] = covenant_c3
+        log.info(f"FlowSwap {swap_id}: M1 locked, outpoint={m1_result.get('htlc_outpoint')}, "
+                 f"covenant={m1_result.get('has_covenant', False)}")
 
         # Per-leg: LP_IN only locks M1, not USDC (LP_OUT handles USDC)
         if is_perleg:
@@ -3952,18 +4275,60 @@ async def flowswap_m1_locked(swap_id: str, req: M1LockedRequest):
     if fs["state"] != FlowSwapState.AWAITING_M1.value:
         raise HTTPException(400, f"Invalid state: {fs['state']} (expected awaiting_m1)")
 
-    # Store H_lp1 and M1 HTLC outpoint
+    # Store H_lp1, M1 HTLC outpoint, and optional BTC HTLC info for watcher
     with _flowswap_lock:
         fs["H_lp1"] = req.H_lp1
         fs["m1_htlc_outpoint"] = req.m1_htlc_outpoint
         fs["m1_htlc_txid"] = req.m1_htlc_outpoint.split(":")[0] if ":" in req.m1_htlc_outpoint else req.m1_htlc_outpoint
+        if req.btc_htlc_address:
+            fs["btc_htlc_address"] = req.btc_htlc_address
+        if req.btc_redeem_script:
+            fs["btc_redeem_script"] = req.btc_redeem_script
         fs["updated_at"] = int(time.time())
         _save_flowswap_db()
 
-    log.info(f"FlowSwap {swap_id}: m1-locked received, outpoint={req.m1_htlc_outpoint}, H_lp1={req.H_lp1[:16]}...")
+    btc_watch = f", btc_htlc={req.btc_htlc_address[:20]}..." if req.btc_htlc_address else ""
+    log.info(f"FlowSwap {swap_id}: m1-locked received, outpoint={req.m1_htlc_outpoint}, H_lp1={req.H_lp1[:16]}...{btc_watch}")
 
-    # TODO: Verify M1 HTLC on BATHRON chain (amount, hashlocks, claim_address)
-    # For testnet, we trust the frontend relay. Production: verify via RPC.
+    # Verify M1 HTLC on BATHRON chain (amount, hashlocks, claim_address)
+    m1_3s = get_m1_htlc_3s()
+    if m1_3s:
+        try:
+            htlc_info = m1_3s.get_htlc(req.m1_htlc_outpoint)
+            if not htlc_info:
+                raise HTTPException(400, f"M1 HTLC not found on-chain: {req.m1_htlc_outpoint}")
+
+            # Verify amount matches expected M1 amount
+            if htlc_info.amount != fs.get("m1_amount_sats", 0):
+                raise HTTPException(400,
+                    f"M1 HTLC amount mismatch: expected {fs.get('m1_amount_sats')}, got {htlc_info.amount}")
+
+            # Verify hashlocks match (H_user and H_lp2 must match our records)
+            if htlc_info.hashlock_user != fs.get("H_user", ""):
+                raise HTTPException(400, "M1 HTLC H_user mismatch")
+            if htlc_info.hashlock_lp2 != fs.get("H_lp2", ""):
+                raise HTTPException(400, "M1 HTLC H_lp2 mismatch")
+            if htlc_info.hashlock_lp1 != req.H_lp1:
+                raise HTTPException(400, "M1 HTLC H_lp1 mismatch")
+
+            # Verify claim_address is our LP_OUT address
+            lp_m1_addr = _lp_addresses.get("m1", "")
+            if lp_m1_addr and htlc_info.claim_address != lp_m1_addr:
+                raise HTTPException(400,
+                    f"M1 HTLC claim_address mismatch: expected {lp_m1_addr}, got {htlc_info.claim_address}")
+
+            # Verify HTLC is still active
+            if htlc_info.status != "active":
+                raise HTTPException(400, f"M1 HTLC not active: {htlc_info.status}")
+
+            log.info(f"FlowSwap {swap_id}: M1 HTLC verified on-chain — "
+                     f"amount={htlc_info.amount}, hashlocks OK, claim_address OK")
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.warning(f"FlowSwap {swap_id}: M1 HTLC verification failed: {e} — proceeding with caution")
+    else:
+        log.warning(f"FlowSwap {swap_id}: M1 client unavailable, skipping HTLC verification")
 
     # Lock USDC on EVM
     evm_htlc = get_evm_htlc_3s()
@@ -4096,40 +4461,56 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
     if not btc_3s:
         raise HTTPException(503, "BTC HTLC3S client not available")
 
-    lp1_claim_wif = fs.get("lp1_claim_wif", "")
-    if not lp1_claim_wif:
-        raise HTTPException(503, "LP1 BTC claim key not available")
-
-    # Get the UTXO
-    utxo = btc_3s.check_htlc_funded(
-        htlc_address=fs["btc_htlc_address"],
-        expected_amount=fs["btc_amount_sats"],
-        min_confirmations=0,
-    )
-    if not utxo:
-        raise HTTPException(400, "BTC HTLC output not found (already spent?)")
-
-    # LP1 BTC receive address
-    lp_btc_key = _load_lp_btc_key()
-    lp1_btc_address = lp_btc_key.get("address", _lp_addresses.get("btc", ""))
-    if not lp1_btc_address:
-        raise HTTPException(503, "LP1 BTC receive address not configured")
-
     from sdk.htlc.btc_3s import HTLC3SSecrets
 
+    secrets_3s = HTLC3SSecrets(
+        S_user=req.S_user,
+        S_lp1=fs["S_lp1"],
+        # Per-leg: S_lp2 received from LP_OUT via /deliver-secret
+        S_lp2=fs.get("S_lp_received") or fs["S_lp2"],
+    )
+
     try:
-        btc_claim_txid = btc_3s.claim_htlc_3s(
-            utxo=utxo,
-            redeem_script=fs["btc_redeem_script"],
-            secrets=HTLC3SSecrets(
-                S_user=req.S_user,
-                S_lp1=fs["S_lp1"],
-                # Per-leg: S_lp2 received from LP_OUT via /deliver-secret
-                S_lp2=fs.get("S_lp_received") or fs["S_lp2"],
-            ),
-            recipient_address=lp1_btc_address,
-            claim_privkey_wif=lp1_claim_wif,
-        )
+        # Fast path: use pre-signed claim TX if available (per-leg pre-commitment)
+        if fs.get("btc_presigned") and fs.get("btc_presign_raw_tx") and fs.get("btc_presign_sig"):
+            log.info(f"FlowSwap {swap_id}: using pre-signed BTC claim TX")
+            presign_data = {
+                "raw_tx": fs["btc_presign_raw_tx"],
+                "signature": fs["btc_presign_sig"],
+                "recipient_address": fs.get("btc_presign_address", ""),
+                "utxo": {"txid": "", "vout": 0, "amount": 0},
+                "redeem_script": fs["btc_redeem_script"],
+            }
+            btc_claim_txid = btc_3s.broadcast_presigned_claim_3s(
+                presign_data=presign_data,
+                secrets=secrets_3s,
+            )
+        else:
+            # Fallback: full claim (build + sign + broadcast)
+            lp1_claim_wif = fs.get("lp1_claim_wif", "")
+            if not lp1_claim_wif:
+                raise HTTPException(503, "LP1 BTC claim key not available")
+
+            utxo = btc_3s.check_htlc_funded(
+                htlc_address=fs["btc_htlc_address"],
+                expected_amount=fs["btc_amount_sats"],
+                min_confirmations=0,
+            )
+            if not utxo:
+                raise HTTPException(400, "BTC HTLC output not found (already spent?)")
+
+            lp_btc_key = _load_lp_btc_key()
+            lp1_btc_address = lp_btc_key.get("address", _lp_addresses.get("btc", ""))
+            if not lp1_btc_address:
+                raise HTTPException(503, "LP1 BTC receive address not configured")
+
+            btc_claim_txid = btc_3s.claim_htlc_3s(
+                utxo=utxo,
+                redeem_script=fs["btc_redeem_script"],
+                secrets=secrets_3s,
+                recipient_address=lp1_btc_address,
+                claim_privkey_wif=lp1_claim_wif,
+            )
     except Exception as e:
         log.error(f"FlowSwap {swap_id}: BTC claim failed: {e}")
         raise HTTPException(500, f"BTC claim failed: {e}")
@@ -7574,6 +7955,359 @@ def stop_evm_watcher():
 
 
 # =============================================================================
+# PER-LEG WATCHER — LP_OUT auto-detects BTC claims without frontend relay
+# =============================================================================
+
+_perleg_watcher_running = False
+_perleg_watcher_thread = None
+PERLEG_WATCHER_INTERVAL = 30  # seconds between BTC chain scans
+
+
+def _perleg_watcher_loop():
+    """Background thread: watches BTC chain for per-leg LP_OUT swaps.
+
+    Safety net for LP_OUT: if the frontend relay (/btc-claimed) fails,
+    LP_OUT independently detects LP_IN's BTC claim and extracts secrets
+    from the witness to auto-complete (claim USDC for user + M1 for self).
+
+    Only applies to per-leg LP_OUT swaps in LP_LOCKED state that have
+    a btc_htlc_address stored (provided by frontend during /m1-locked).
+    """
+    global _perleg_watcher_running
+    _perleg_watcher_running = True
+    log.info("Per-leg watcher started — monitoring BTC chain for LP_OUT auto-completion")
+
+    while _perleg_watcher_running:
+        try:
+            _perleg_check_btc_claims()
+        except Exception as e:
+            log.error(f"Per-leg watcher error: {e}")
+
+        time.sleep(PERLEG_WATCHER_INTERVAL)
+
+
+def _perleg_check_btc_claims():
+    """Scan per-leg LP_OUT swaps in LP_LOCKED state for BTC claims."""
+    candidates = []
+    with _flowswap_lock:
+        for swap_id, fs in flowswap_db.items():
+            if not fs.get("is_perleg"):
+                continue
+            if fs.get("leg") != "M1/USDC":
+                continue
+            if fs.get("state") != FlowSwapState.LP_LOCKED.value:
+                continue
+            if not fs.get("btc_htlc_address"):
+                continue  # No BTC HTLC info — can't watch
+            candidates.append((swap_id, dict(fs)))
+
+    if not candidates:
+        return
+
+    btc_3s = get_btc_htlc_3s()
+    if not btc_3s:
+        return  # No BTC client — skip this round
+
+    import json as _json
+    for swap_id, fs_copy in candidates:
+        try:
+            btc_addr = fs_copy["btc_htlc_address"]
+
+            # Check if BTC HTLC has been spent (claimed or refunded)
+            scan = btc_3s.client._call(
+                "scantxoutset", "start",
+                _json.dumps([f"addr({btc_addr})"])
+            )
+            if not scan or not scan.get("success"):
+                continue
+
+            unspents = scan.get("unspents", [])
+            if unspents:
+                continue  # Still unspent — LP_IN hasn't claimed yet
+
+            log.info(f"Per-leg watcher: BTC HTLC spent for {swap_id}, searching for claim TX...")
+
+            # Find the claim TX and extract secrets
+            secrets = _perleg_find_and_extract_secrets(
+                btc_3s, fs_copy, swap_id
+            )
+            if not secrets:
+                log.warning(f"Per-leg watcher: could not extract secrets for {swap_id}")
+                continue
+
+            # Verify secrets match stored hashlocks
+            S_user = secrets["S_user"]
+            S_lp1 = secrets["S_lp1"]
+
+            computed_H_user = hashlib.sha256(bytes.fromhex(S_user)).hexdigest()
+            if computed_H_user != fs_copy.get("H_user"):
+                log.warning(f"Per-leg watcher: S_user hash mismatch for {swap_id}")
+                continue
+
+            computed_H_lp1 = hashlib.sha256(bytes.fromhex(S_lp1)).hexdigest()
+            if computed_H_lp1 != fs_copy.get("H_lp1"):
+                log.warning(f"Per-leg watcher: S_lp1 hash mismatch for {swap_id}")
+                continue
+
+            log.info(f"Per-leg watcher: secrets verified for {swap_id} — auto-triggering completion")
+
+            # Transition to BTC_CLAIMED and launch completion (same as /btc-claimed endpoint)
+            with _flowswap_lock:
+                fs_live = flowswap_db.get(swap_id)
+                if not fs_live:
+                    continue
+                # Double-check state hasn't changed since scan
+                if fs_live.get("state") != FlowSwapState.LP_LOCKED.value:
+                    log.info(f"Per-leg watcher: {swap_id} state changed to {fs_live.get('state')}, skipping")
+                    continue
+                fs_live["S_user"] = S_user
+                fs_live["S_lp1"] = S_lp1
+                fs_live["btc_claim_txid"] = secrets.get("btc_claim_txid", "")
+                fs_live["state"] = FlowSwapState.BTC_CLAIMED.value
+                fs_live["updated_at"] = int(time.time())
+                fs_live["watcher_detected"] = True  # Mark as watcher-detected
+                _save_flowswap_db()
+
+            # Launch completion thread (same logic as /btc-claimed endpoint)
+            _perleg_launch_completion(swap_id)
+
+        except Exception as e:
+            log.error(f"Per-leg watcher: error checking {swap_id}: {e}")
+
+
+def _perleg_find_and_extract_secrets(btc_3s, fs_copy: dict, swap_id: str) -> Optional[dict]:
+    """Find BTC claim TX and extract 3 secrets from witness.
+
+    BTC HTLC-1 is a 3S HTLC. LP_IN claims with witness:
+    [sig, S_lp2, S_lp1, S_user, 0x01, redeemScript]
+
+    Returns dict with S_user, S_lp1, S_lp2, btc_claim_txid or None.
+    """
+    btc_redeem_script = fs_copy.get("btc_redeem_script")
+    if not btc_redeem_script:
+        return None
+
+    try:
+        current_height = btc_3s.client.get_block_count()
+
+        # Search last 10 blocks (wider window for safety)
+        for height in range(current_height, max(0, current_height - 10), -1):
+            block_hash = btc_3s.client._call("getblockhash", height)
+            block = btc_3s.client._call("getblock", block_hash, 2)  # verbosity=2
+
+            for tx in block.get("tx", []):
+                result = _perleg_extract_from_tx(tx, btc_redeem_script, fs_copy)
+                if result:
+                    result["btc_claim_txid"] = tx["txid"]
+                    return result
+
+        # Also check mempool
+        mempool_txids = btc_3s.client._call("getrawmempool")
+        if mempool_txids:
+            for txid in mempool_txids[:50]:
+                tx = btc_3s.client._call("getrawtransaction", txid, True)
+                if tx:
+                    result = _perleg_extract_from_tx(tx, btc_redeem_script, fs_copy)
+                    if result:
+                        result["btc_claim_txid"] = tx["txid"]
+                        return result
+
+    except Exception as e:
+        log.error(f"Per-leg watcher: error finding claim TX for {swap_id}: {e}")
+
+    return None
+
+
+def _perleg_extract_from_tx(tx: dict, expected_script: str, fs_copy: dict) -> Optional[dict]:
+    """Extract 3 secrets from a BTC claim TX witness matching our redeem script."""
+    for vin in tx.get("vin", []):
+        witness = vin.get("txinwitness", [])
+
+        # 3S claim witness: [sig, S_lp2, S_lp1, S_user, 0x01, redeemScript]
+        if len(witness) != 6:
+            continue
+        if witness[4] != "01":
+            continue  # Not the claim branch
+        if witness[-1] != expected_script:
+            continue  # Different HTLC
+
+        # Validate secret sizes (32 bytes each)
+        try:
+            S_lp2 = witness[1]
+            S_lp1 = witness[2]
+            S_user = witness[3]
+
+            if len(bytes.fromhex(S_user)) != 32:
+                continue
+            if len(bytes.fromhex(S_lp1)) != 32:
+                continue
+            if len(bytes.fromhex(S_lp2)) != 32:
+                continue
+        except (ValueError, TypeError):
+            continue
+
+        # Verify against stored hashlocks
+        import hashlib as _hl
+        if _hl.sha256(bytes.fromhex(S_user)).hexdigest() != fs_copy.get("H_user", ""):
+            continue
+        if _hl.sha256(bytes.fromhex(S_lp1)).hexdigest() != fs_copy.get("H_lp1", ""):
+            continue
+
+        return {"S_user": S_user, "S_lp1": S_lp1, "S_lp2": S_lp2}
+
+    return None
+
+
+def _perleg_launch_completion(swap_id: str):
+    """Launch LP_OUT completion thread for a per-leg swap.
+
+    Reuses the same logic as the /btc-claimed endpoint's _complete_lp_out,
+    but called from the watcher or startup recovery.
+    """
+    fs = flowswap_db.get(swap_id)
+    if not fs:
+        return
+
+    def _complete_lp_out_watcher():
+        """LP_OUT completion (watcher-triggered)."""
+        try:
+            btc_claim_txid_local = fs.get("btc_claim_txid", "")
+
+            # ── GATE: Wait for BTC claim TX confirmation ──
+            if btc_claim_txid_local and BTC_CLAIM_MIN_CONFIRMATIONS > 0:
+                btc_3s_gate = get_btc_htlc_3s()
+                if not btc_3s_gate:
+                    log.error(f"FlowSwap {swap_id}: watcher LP_OUT BTC client unavailable — FAIL-CLOSED")
+                    with _flowswap_lock:
+                        fs["state"] = FlowSwapState.FAILED.value
+                        fs["error"] = "BTC client unavailable (watcher). USDC NOT released."
+                        fs["updated_at"] = int(time.time())
+                        _release_reservation(swap_id)
+                        _save_flowswap_db()
+                    return
+
+                poll_start = time.time()
+                confirmed = False
+
+                log.info(f"FlowSwap {swap_id}: watcher GATING — waiting for BTC claim "
+                         f"{btc_claim_txid_local[:16]}... to reach "
+                         f"{BTC_CLAIM_MIN_CONFIRMATIONS} conf(s)")
+
+                while time.time() - poll_start < BTC_CLAIM_CONFIRMATION_TIMEOUT:
+                    try:
+                        tx_info = btc_3s_gate.client._call(
+                            "getrawtransaction", btc_claim_txid_local, True
+                        )
+                        confs = tx_info.get("confirmations", 0) if tx_info else 0
+                        with _flowswap_lock:
+                            fs["btc_claim_confs"] = confs
+                            fs["updated_at"] = int(time.time())
+                            _save_flowswap_db()
+                        if confs >= BTC_CLAIM_MIN_CONFIRMATIONS:
+                            confirmed = True
+                            break
+                    except Exception as e:
+                        log.warning(f"FlowSwap {swap_id}: watcher BTC conf check error: {e}")
+                    time.sleep(15)
+
+                if not confirmed:
+                    log.error(f"FlowSwap {swap_id}: watcher BTC claim not confirmed in time — FAIL-CLOSED")
+                    with _flowswap_lock:
+                        fs["state"] = FlowSwapState.FAILED.value
+                        fs["error"] = "BTC claim not confirmed in time (watcher). USDC NOT released."
+                        fs["updated_at"] = int(time.time())
+                        _release_reservation(swap_id)
+                        _save_flowswap_db()
+                    return
+
+            # ── Claim USDC on EVM for user ──
+            if not fs.get("evm_claim_txhash"):
+                evm = get_evm_htlc_3s()
+                evm_privkey = _load_evm_private_key()
+                if evm and evm_privkey and fs.get("evm_htlc_id"):
+                    evm_result = evm.claim_htlc(
+                        htlc_id=fs["evm_htlc_id"],
+                        S_user=fs["S_user"],
+                        S_lp1=fs["S_lp1"],
+                        S_lp2=fs["S_lp2"],
+                        private_key=evm_privkey,
+                    )
+                    if evm_result.success:
+                        with _flowswap_lock:
+                            fs["evm_claim_txhash"] = evm_result.tx_hash
+                            fs["updated_at"] = int(time.time())
+                            _save_flowswap_db()
+                        log.info(f"FlowSwap {swap_id}: watcher LP_OUT USDC claimed, tx={evm_result.tx_hash}")
+                    else:
+                        log.error(f"FlowSwap {swap_id}: watcher LP_OUT USDC claim failed: {evm_result.error}")
+                else:
+                    log.error(f"FlowSwap {swap_id}: watcher LP_OUT cannot claim USDC — missing evm client/key/htlc_id")
+
+            # ── Claim M1 on BATHRON for LP_OUT ──
+            m1_claimed = True
+            if not fs.get("m1_claim_txid"):
+                m1_3s = get_m1_htlc_3s()
+                if m1_3s:
+                    m1_claimed = False
+                    for attempt in range(12):
+                        try:
+                            m1_result = m1_3s.claim(
+                                htlc_outpoint=fs["m1_htlc_outpoint"],
+                                S_user=fs["S_user"],
+                                S_lp1=fs["S_lp1"],
+                                S_lp2=fs["S_lp2"],
+                            )
+                            with _flowswap_lock:
+                                fs["m1_claim_txid"] = m1_result.get("txid")
+                                fs["updated_at"] = int(time.time())
+                                _save_flowswap_db()
+                            log.info(f"FlowSwap {swap_id}: watcher LP_OUT M1 claimed, txid={m1_result.get('txid')}")
+                            m1_claimed = True
+                            break
+                        except Exception as e:
+                            if "not found" in str(e).lower():
+                                log.info(f"FlowSwap {swap_id}: watcher M1 HTLC not in block yet ({attempt+1}/12)")
+                            else:
+                                log.error(f"FlowSwap {swap_id}: watcher M1 claim error ({attempt+1}/12): {e}")
+                            time.sleep(10)
+                else:
+                    m1_claimed = False
+
+            # Mark complete
+            with _flowswap_lock:
+                fs["state"] = FlowSwapState.COMPLETED.value
+                fs["completed_at"] = int(time.time())
+                fs["updated_at"] = int(time.time())
+                if not m1_claimed:
+                    fs["m1_claim_failed"] = True
+                _release_reservation(swap_id)
+                _save_flowswap_db()
+            log.info(f"FlowSwap {swap_id}: watcher LP_OUT COMPLETED (m1_claimed={m1_claimed})")
+
+        except Exception as e:
+            log.error(f"FlowSwap {swap_id}: watcher LP_OUT completion error: {e}")
+            with _flowswap_lock:
+                fs["state"] = FlowSwapState.FAILED.value
+                fs["error"] = f"Watcher LP_OUT completion error: {e}"
+                fs["updated_at"] = int(time.time())
+                _release_reservation(swap_id)
+                _save_flowswap_db()
+
+    with _flowswap_lock:
+        fs["state"] = FlowSwapState.COMPLETING.value
+        fs["updated_at"] = int(time.time())
+        _save_flowswap_db()
+    threading.Thread(target=_complete_lp_out_watcher, daemon=True).start()
+    log.info(f"Per-leg watcher: launched completion thread for {swap_id}")
+
+
+def stop_perleg_watcher():
+    """Stop the per-leg watcher thread."""
+    global _perleg_watcher_running
+    _perleg_watcher_running = False
+
+
+# =============================================================================
 # FULL ATOMIC SWAP ENDPOINT (PRODUCTION FLOW)
 # =============================================================================
 
@@ -8183,6 +8917,11 @@ async def startup_event():
     _evm_watcher_thread = threading.Thread(target=start_evm_watcher, daemon=True)
     _evm_watcher_thread.start()
 
+    # Start per-leg watcher thread (LP_OUT auto-detects BTC claims)
+    global _perleg_watcher_thread
+    _perleg_watcher_thread = threading.Thread(target=_perleg_watcher_loop, daemon=True)
+    _perleg_watcher_thread.start()
+
     # Start auto-refund checker (expired BTC HTLCs + M1 HTLCs + completion watchdog)
     async def _auto_refund_checker():
         """Check for expired HTLCs, auto-refund, M1 recovery, and completion watchdog every 60s."""
@@ -8215,6 +8954,7 @@ async def shutdown_event():
     """Cleanup on shutdown."""
     _save_flowswap_db()
     stop_evm_watcher()
+    stop_perleg_watcher()
     if _httpx_client and not _httpx_client.is_closed:
         await _httpx_client.aclose()
     log.info("Swap monitor stopped")

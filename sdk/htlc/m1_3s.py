@@ -47,7 +47,9 @@ class M1Htlc3S:
 
     def create_htlc(self, receipt_outpoint: str, H_user: str,
                     H_lp1: str, H_lp2: str, claim_address: str,
-                    expiry_blocks: int = 120) -> Dict:
+                    expiry_blocks: int = 120,
+                    template_commitment: str = None,
+                    covenant_dest_address: str = None) -> Dict:
         """
         Create 3-secret HTLC from M1 receipt.
 
@@ -58,22 +60,30 @@ class M1Htlc3S:
             H_lp2: SHA256 hashlock for LP2 (64 hex)
             claim_address: BATHRON address that can claim with 3 preimages
             expiry_blocks: Blocks until refund (default 120 = ~2h)
+            template_commitment: C3 covenant hash (64 hex) for per-leg mode
+            covenant_dest_address: LP_OUT address forced by covenant
 
         Returns:
             {"txid": "...", "htlc_outpoint": "txid:0", "amount": ..., "expiry_height": ...}
         """
+        covenant_str = ""
+        if template_commitment and covenant_dest_address:
+            covenant_str = f", covenant → {covenant_dest_address}"
         log.info(f"Creating M1 HTLC3S: receipt={receipt_outpoint}, "
-                 f"H_user={H_user[:16]}..., claim={claim_address}")
+                 f"H_user={H_user[:16]}..., claim={claim_address}{covenant_str}")
 
         result = self.client.htlc3s_create(
             receipt_outpoint, H_user, H_lp1, H_lp2,
-            claim_address, expiry_blocks
+            claim_address, expiry_blocks,
+            template_commitment=template_commitment,
+            covenant_dest_address=covenant_dest_address
         )
 
         if not result:
             raise RuntimeError("HTLC3S creation failed")
 
-        log.info(f"M1 HTLC3S created: txid={result.get('txid')}")
+        log.info(f"M1 HTLC3S created: txid={result.get('txid')}, "
+                 f"has_covenant={result.get('has_covenant', False)}")
         return result
 
     def claim(self, htlc_outpoint: str, S_user: str,

@@ -687,6 +687,148 @@ class BTCHTLC3S:
             log.error(f"Failed to extract secrets from {txid}: {e}")
             return None
 
+    def presign_claim_3s(
+        self,
+        utxo: Dict,
+        redeem_script: str,
+        recipient_address: str,
+        claim_privkey_wif: str,
+        fee_rate_sat_vb: int = 2
+    ) -> Dict:
+        """
+        Pre-sign BTC claim TX (before secrets are known).
+
+        In segwit P2WSH, the sighash covers TX structure (inputs/outputs)
+        but NOT the witness stack (secrets). So we can sign before knowing
+        S_user, S_lp1, S_lp2 — they're assembled into the witness later.
+
+        Args:
+            utxo: UTXO dict with txid, vout, amount (sats)
+            redeem_script: Redeem script hex
+            recipient_address: Where to send claimed funds
+            claim_privkey_wif: WIF private key for signing
+            fee_rate_sat_vb: Fee rate in sat/vbyte
+
+        Returns:
+            {
+                "raw_tx": unsigned TX hex,
+                "signature": DER signature with SIGHASH byte (hex),
+                "recipient_address": str,
+                "utxo": dict,
+                "redeem_script": str,
+            }
+        """
+        txid = utxo["txid"]
+        vout = utxo["vout"]
+        amount_sats = utxo["amount"]
+
+        log.info(f"Pre-signing 3S-HTLC claim: {txid}:{vout}")
+
+        script_bytes = bytes.fromhex(redeem_script)
+
+        # Estimate fee
+        estimated_vsize = 180 + len(script_bytes) // 4
+        fee_sats = estimated_vsize * fee_rate_sat_vb
+
+        output_amount_sats = amount_sats - fee_sats
+        if output_amount_sats <= 546:
+            raise ValueError(f"Output {output_amount_sats} below dust")
+
+        output_amount_btc = output_amount_sats / 100_000_000
+
+        # Create raw transaction
+        inputs = [{"txid": txid, "vout": vout}]
+        outputs = {recipient_address: f"{output_amount_btc:.8f}"}
+
+        raw_tx = self.client.create_raw_transaction(inputs, outputs)
+
+        # Sign (sighash doesn't depend on witness secrets)
+        try:
+            from bitcoin import SelectParams
+            from bitcoin.core import CMutableTransaction, CScript
+            from bitcoin.core.script import (
+                SignatureHash, SIGHASH_ALL, SIGVERSION_WITNESS_V0
+            )
+            from bitcoin.wallet import CBitcoinSecret
+
+            SelectParams('signet')
+
+            tx = CMutableTransaction.deserialize(bytes.fromhex(raw_tx))
+            privkey = CBitcoinSecret(claim_privkey_wif)
+            witness_script = CScript(script_bytes)
+
+            sighash = SignatureHash(
+                script=witness_script,
+                txTo=tx,
+                inIdx=0,
+                hashtype=SIGHASH_ALL,
+                amount=amount_sats,
+                sigversion=SIGVERSION_WITNESS_V0
+            )
+
+            sig = privkey.sign(sighash) + bytes([SIGHASH_ALL])
+            log.info(f"Pre-sign OK: sig={sig.hex()[:20]}...")
+
+            return {
+                "raw_tx": raw_tx,
+                "signature": sig.hex(),
+                "recipient_address": recipient_address,
+                "utxo": utxo,
+                "redeem_script": redeem_script,
+            }
+
+        except ImportError:
+            raise NotImplementedError(
+                "python-bitcoinlib required for 3S-HTLC pre-signing. "
+                "Install with: pip install python-bitcoinlib"
+            )
+
+    def broadcast_presigned_claim_3s(
+        self,
+        presign_data: Dict,
+        secrets: HTLC3SSecrets,
+    ) -> str:
+        """
+        Assemble witness from pre-signed data + secrets and broadcast.
+
+        Args:
+            presign_data: Result from presign_claim_3s()
+            secrets: HTLC3SSecrets with S_user, S_lp1, S_lp2
+
+        Returns:
+            Claim transaction ID
+        """
+        raw_tx = presign_data["raw_tx"]
+        sig = bytes.fromhex(presign_data["signature"])
+        redeem_script = presign_data["redeem_script"]
+        script_bytes = bytes.fromhex(redeem_script)
+
+        # Verify preimages match script hashlocks
+        self._verify_preimages_match_script(secrets, script_bytes)
+
+        # Build witness stack
+        witness_stack = self.build_claim_witness_3s(secrets, sig, script_bytes)
+
+        # Assemble segwit TX with witness
+        from bitcoin import SelectParams
+        from bitcoin.core import CMutableTransaction, CTxInWitness, CTxWitness, CScriptWitness, b2x
+
+        SelectParams('signet')
+
+        tx = CMutableTransaction.deserialize(bytes.fromhex(raw_tx))
+
+        script_witness = CScriptWitness(witness_stack)
+        txin_witness = CTxInWitness(script_witness)
+        tx.wit = CTxWitness([txin_witness])
+
+        signed_hex = b2x(tx.serialize())
+        log.info(f"Assembled pre-signed claim: {signed_hex[:40]}...")
+
+        # Broadcast
+        claim_txid = self.client.send_raw_transaction(signed_hex)
+        log.info(f"Pre-signed 3S-HTLC claimed: txid={claim_txid}")
+        return claim_txid
+
     def claim_htlc_3s(
         self,
         utxo: Dict,
