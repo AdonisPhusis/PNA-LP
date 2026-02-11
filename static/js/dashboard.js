@@ -155,57 +155,73 @@ async function loadOverview() {
     await loadRecentSwaps();
 }
 
+// Chain metadata for display (icon, color, name)
+const CHAIN_META = {
+    btc:   { name: 'Bitcoin',       icon: '\u20bf', color: '#f7931a' },
+    m1:    { name: 'M1 (BATHRON)',  icon: 'M',      color: '#3b82f6' },
+    usdc:  { name: 'USDC (Base)',   icon: '$',      color: '#2775ca' },
+    pivx:  { name: 'PIVX',         icon: 'P',      color: '#6b3fa0' },
+    dash:  { name: 'Dash',         icon: 'D',      color: '#008ce7' },
+    zcash: { name: 'Zcash',        icon: 'Z',      color: '#f4b728' },
+};
+
 async function renderChainStatus() {
     const grid = document.getElementById('chain-status-grid');
 
-    // Fetch real chain status
+    // Fetch real chain status from server (includes all chains)
     const data = await apiCall('/api/chains/status');
     const chainInfo = data?.chains || {};
 
-    // Get sync status for BTC and M1
-    const btcSync = await apiCall('/api/chain/btc/sync');
-    const m1Sync = await apiCall('/api/chain/m1/sync');
+    // Build list of chains to show: only installed chains + usdc (always shown)
+    const chainsToShow = [];
+    for (const [id, status] of Object.entries(chainInfo)) {
+        if (id === 'usdc' || status.installed || status.running) {
+            chainsToShow.push(id);
+        }
+    }
 
-    const chains = [
-        { id: 'btc', name: 'Bitcoin', icon: '\u20bf', color: '#f7931a', sync: btcSync },
-        { id: 'm1', name: 'M1 (BATHRON)', icon: 'M', color: '#3b82f6', sync: m1Sync },
-        { id: 'usdc', name: 'USDC (Base)', icon: '$', color: '#2775ca', sync: null },
-    ];
+    // Fetch sync status for all installed non-USDC chains in parallel
+    const syncPromises = {};
+    for (const id of chainsToShow) {
+        if (id !== 'usdc' && chainInfo[id]?.installed) {
+            syncPromises[id] = apiCall(`/api/chain/${id}/sync`);
+        }
+    }
+    const syncResults = {};
+    for (const [id, promise] of Object.entries(syncPromises)) {
+        syncResults[id] = await promise;
+    }
 
-    grid.innerHTML = chains.map(chain => {
-        const status = chainInfo[chain.id] || {};
-        let isConnected = false;
+    grid.innerHTML = chainsToShow.map(id => {
+        const meta = CHAIN_META[id] || { name: id, icon: '?', color: '#888' };
+        const status = chainInfo[id] || {};
+        const sync = syncResults[id];
         let heightText = '-';
-
         let statusClass = 'disconnected';
 
-        if (chain.id === 'usdc') {
-            // USDC uses external RPC, always "connected" if enabled
-            isConnected = status.installed;
-            heightText = isConnected ? 'RPC OK' : 'Not configured';
-            statusClass = isConnected ? 'connected' : 'disconnected';
-        } else if (chain.sync && !chain.sync.error) {
-            // BTC or M1 with sync data
-            isConnected = true;
-            heightText = chain.sync.blocks?.toLocaleString() || '-';
-            if (chain.sync.syncing) {
-                heightText += ` (${chain.sync.progress?.toFixed(0)}%)`;
-                statusClass = 'syncing';  // Orange while syncing
+        if (id === 'usdc') {
+            const isOk = status.installed;
+            heightText = isOk ? 'RPC OK' : 'Not configured';
+            statusClass = isOk ? 'connected' : 'disconnected';
+        } else if (sync && !sync.error) {
+            heightText = sync.blocks?.toLocaleString() || '-';
+            if (sync.syncing) {
+                heightText += ` (${sync.progress?.toFixed(0)}%)`;
+                statusClass = 'syncing';
             } else {
-                statusClass = 'connected';  // Green when synced
+                statusClass = 'connected';
             }
         } else {
-            isConnected = false;
             heightText = status.installed ? 'Stopped' : 'Not installed';
             statusClass = 'disconnected';
         }
 
         return `
         <div class="chain-status-item">
-            <span class="chain-icon" style="color: ${chain.color}">${chain.icon}</span>
+            <span class="chain-icon" style="color: ${meta.color}">${meta.icon}</span>
             <div class="chain-info">
-                <div class="chain-name">${chain.name}</div>
-                <div class="chain-height">${chain.id === 'usdc' ? '' : 'Block: '}${heightText}</div>
+                <div class="chain-name">${meta.name}</div>
+                <div class="chain-height">${id === 'usdc' ? '' : 'Block: '}${heightText}</div>
             </div>
             <span class="status-dot ${statusClass}"></span>
         </div>
@@ -1775,7 +1791,7 @@ async function refreshChainStatuses() {
     if (!data || !data.chains) return;
 
     for (const [chain, status] of Object.entries(data.chains)) {
-        if (chain === 'usdc') continue; // Skip USDC (no install)
+        if (chain === 'usdc') continue; // Skip USDC (no local daemon)
 
         const installStatus = document.getElementById(`${chain}-install-status`);
         const installBtn = document.getElementById(`${chain}-install-btn`);

@@ -278,6 +278,113 @@
                             </div>
                         </div>
                     </div>
+                    <!-- PIVX -->
+                    <div class="chain-card" data-chain="pivx">
+                        <div class="chain-header">
+                            <span class="chain-icon" style="color: #6b3fa0">P</span>
+                            <div>
+                                <h3>PIVX</h3>
+                                <span class="chain-network">Testnet</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="chain-pivx-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="chain-body">
+                            <div class="install-section" id="pivx-install-section">
+                                <div class="install-status" id="pivx-install-status">
+                                    <span class="status-icon">&#9744;</span>
+                                    <span>Not installed</span>
+                                </div>
+                            </div>
+                            <div class="chain-status" id="pivx-chain-status">
+                                <span class="status-dot disconnected"></span>
+                                <span>Not connected</span>
+                            </div>
+                            <div class="sync-progress hidden" id="pivx-sync-progress">
+                                <div class="progress-bar"><div class="progress-fill" id="pivx-sync-fill"></div></div>
+                                <div class="progress-text" id="pivx-sync-text">Syncing...</div>
+                            </div>
+                            <div class="chain-actions">
+                                <button class="btn btn-secondary" onclick="testChainConnection('pivx')">Test Connection</button>
+                                <button class="btn btn-secondary" onclick="startChain('pivx')">Start</button>
+                                <button class="btn btn-secondary" onclick="stopChain('pivx')">Stop</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Dash -->
+                    <div class="chain-card" data-chain="dash">
+                        <div class="chain-header">
+                            <span class="chain-icon" style="color: #008ce7">D</span>
+                            <div>
+                                <h3>Dash</h3>
+                                <span class="chain-network">Testnet</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="chain-dash-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="chain-body">
+                            <div class="install-section" id="dash-install-section">
+                                <div class="install-status" id="dash-install-status">
+                                    <span class="status-icon">&#9744;</span>
+                                    <span>Not installed</span>
+                                </div>
+                            </div>
+                            <div class="chain-status" id="dash-chain-status">
+                                <span class="status-dot disconnected"></span>
+                                <span>Not connected</span>
+                            </div>
+                            <div class="sync-progress hidden" id="dash-sync-progress">
+                                <div class="progress-bar"><div class="progress-fill" id="dash-sync-fill"></div></div>
+                                <div class="progress-text" id="dash-sync-text">Syncing...</div>
+                            </div>
+                            <div class="chain-actions">
+                                <button class="btn btn-secondary" onclick="testChainConnection('dash')">Test Connection</button>
+                                <button class="btn btn-secondary" onclick="startChain('dash')">Start</button>
+                                <button class="btn btn-secondary" onclick="stopChain('dash')">Stop</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Zcash -->
+                    <div class="chain-card" data-chain="zcash">
+                        <div class="chain-header">
+                            <span class="chain-icon" style="color: #f4b728">Z</span>
+                            <div>
+                                <h3>Zcash</h3>
+                                <span class="chain-network">Testnet</span>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="chain-zcash-enabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <div class="chain-body">
+                            <div class="install-section" id="zcash-install-section">
+                                <div class="install-status" id="zcash-install-status">
+                                    <span class="status-icon">&#9744;</span>
+                                    <span>Not installed</span>
+                                </div>
+                            </div>
+                            <div class="chain-status" id="zcash-chain-status">
+                                <span class="status-dot disconnected"></span>
+                                <span>Not connected</span>
+                            </div>
+                            <div class="sync-progress hidden" id="zcash-sync-progress">
+                                <div class="progress-bar"><div class="progress-fill" id="zcash-sync-fill"></div></div>
+                                <div class="progress-text" id="zcash-sync-text">Syncing...</div>
+                            </div>
+                            <div class="chain-actions">
+                                <button class="btn btn-secondary" onclick="testChainConnection('zcash')">Test Connection</button>
+                                <button class="btn btn-secondary" onclick="startChain('zcash')">Start</button>
+                                <button class="btn btn-secondary" onclick="stopChain('zcash')">Stop</button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="actions-bar">

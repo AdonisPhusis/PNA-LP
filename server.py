@@ -602,7 +602,7 @@ async def get_status():
 
     return {
         "status": "ok",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "timestamp": int(time.time()),
         "test_mode": test_mode,
         "swaps_active": regular_active + atomic_active + flowswap_active,
@@ -5496,7 +5496,7 @@ import subprocess
 
 def check_chain_status_on_startup():
     """Check if chains are installed and running on server startup."""
-    for chain in ["btc", "m1"]:
+    for chain in ["btc", "m1", "pivx", "dash", "zcash"]:
         binary = CHAIN_BINARIES.get(chain)
         if binary and binary.exists():
             chain_status_db[chain]["installed"] = True
@@ -5689,15 +5689,30 @@ def get_btc_htlc() -> "BTCHtlc":
 @app.post("/api/chain/{chain}/test")
 async def test_chain_connection(chain: str):
     """Test chain RPC connection."""
-    if chain not in ["btc", "m1", "usdc"]:
+    supported = ["btc", "m1", "usdc", "pivx", "dash", "zcash"]
+    if chain not in supported:
         raise HTTPException(400, f"Unknown chain: {chain}")
 
-    # Mock test - in production: actually test RPC
     status = chain_status_db.get(chain, {})
 
     if chain == "usdc":
         # Test EVM RPC
         return {"connected": True, "height": 12345678, "chain": "base"}
+
+    # For native chains, try getblockcount for a real connectivity test
+    cli = CHAIN_CLI.get(chain)
+    if cli and cli.exists():
+        try:
+            if chain == "btc":
+                cmd = [str(cli), "-signet", f"-datadir={Path.home() / '.bitcoin-signet'}", "getblockcount"]
+            else:
+                cmd = [str(cli), "-testnet", "getblockcount"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                height = int(result.stdout.strip())
+                return {"connected": True, "height": height, "chain": chain}
+        except Exception:
+            pass
 
     return {
         "connected": status.get("running", False),
@@ -5822,7 +5837,8 @@ async def get_install_status(chain: str, job_id: str = Query(...)):
 @app.post("/api/chain/{chain}/start")
 async def start_chain(chain: str):
     """Start chain daemon."""
-    if chain not in ["btc", "m1"]:
+    supported = ["btc", "m1", "pivx", "dash", "zcash"]
+    if chain not in supported:
         raise HTTPException(400, f"Cannot start chain: {chain}")
 
     binary = CHAIN_BINARIES.get(chain)
@@ -5833,7 +5849,9 @@ async def start_chain(chain: str):
         # Start daemon
         if chain == "btc":
             cmd = [str(binary), "-signet", "-daemon"]
-        else:  # m1
+        elif chain == "zcash":
+            cmd = [str(binary), "-testnet", "-daemon", f"-exportdir=/tmp"]
+        else:  # m1, pivx, dash
             cmd = [str(binary), "-testnet", "-daemon"]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -5865,7 +5883,8 @@ async def start_chain(chain: str):
 @app.post("/api/chain/{chain}/stop")
 async def stop_chain(chain: str):
     """Stop chain daemon."""
-    if chain not in ["btc", "m1"]:
+    supported = ["btc", "m1", "pivx", "dash", "zcash"]
+    if chain not in supported:
         raise HTTPException(400, f"Cannot stop chain: {chain}")
 
     cli = CHAIN_CLI.get(chain)
@@ -5876,7 +5895,7 @@ async def stop_chain(chain: str):
         # Stop daemon via CLI
         if chain == "btc":
             cmd = [str(cli), "-signet", "stop"]
-        else:  # m1
+        else:  # m1, pivx, dash, zcash
             cmd = [str(cli), "-testnet", "stop"]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -5902,7 +5921,8 @@ async def stop_chain(chain: str):
 @app.get("/api/chain/{chain}/sync")
 async def get_chain_sync_status(chain: str):
     """Get blockchain sync status."""
-    if chain not in ["btc", "m1"]:
+    supported = ["btc", "m1", "pivx", "dash", "zcash"]
+    if chain not in supported:
         raise HTTPException(400, f"Cannot get sync for chain: {chain}")
 
     cli = CHAIN_CLI.get(chain)
@@ -5913,7 +5933,7 @@ async def get_chain_sync_status(chain: str):
         # Call getblockchaininfo
         if chain == "btc":
             cmd = [str(cli), "-signet", f"-datadir={Path.home() / '.bitcoin-signet'}", "getblockchaininfo"]
-        else:  # m1
+        else:  # m1, pivx, dash, zcash — all use -testnet
             cmd = [str(cli), "-testnet", "getblockchaininfo"]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -6233,7 +6253,7 @@ async def debug_usdc_htlc():
 async def get_all_chains_status():
     """Get status of all chains (refreshes installed/running status)."""
     # Re-check installation and running status
-    for chain in ["btc", "m1"]:
+    for chain in ["btc", "m1", "pivx", "dash", "zcash"]:
         binary = CHAIN_BINARIES.get(chain)
         if binary and binary.exists():
             chain_status_db[chain]["installed"] = True
