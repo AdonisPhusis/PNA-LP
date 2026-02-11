@@ -113,6 +113,23 @@ async function checkApiStatus() {
 }
 
 // =============================================================================
+// LP IDENTITY
+// =============================================================================
+
+async function loadLPIdentity() {
+    const info = await apiCall('/api/lp/info');
+    if (!info) return;
+
+    const nameInput = document.getElementById('lp-display-name');
+    const idDisplay = document.getElementById('lp-id-display');
+    const sidebarName = document.getElementById('sidebar-lp-name');
+
+    if (nameInput) nameInput.value = info.name || '';
+    if (idDisplay) idDisplay.value = info.lp_id || '';
+    if (sidebarName) sidebarName.textContent = info.name || info.lp_id || '';
+}
+
+// =============================================================================
 // OVERVIEW PAGE
 // =============================================================================
 
@@ -506,6 +523,21 @@ async function loadWallets() {
 
         document.getElementById('wallet-usdc-address').textContent =
             data.usdc.address || 'Not configured';
+    }
+
+    // PIVX / Dash / Zcash
+    for (const chain of ['pivx', 'dash', 'zec']) {
+        if (data[chain]) {
+            const balEl = document.getElementById(`wallet-${chain}-balance`);
+            const addrEl = document.getElementById(`wallet-${chain}-address`);
+            if (balEl) {
+                const bal = data[chain].balance;
+                balEl.textContent = bal != null ? bal.toFixed(8) : '-';
+            }
+            if (addrEl) {
+                addrEl.textContent = data[chain].address || 'Syncing...';
+            }
+        }
     }
 }
 
@@ -1665,7 +1697,11 @@ async function saveAllConfig() {
 
 // Push LP config to server
 async function pushConfigToServer() {
+    // LP display name
+    const lpName = document.getElementById('lp-display-name')?.value?.trim() || undefined;
+
     const config = {
+        name: lpName,
         pairs: {
             'BTC/M1': {
                 enabled: document.getElementById('pair-btc-m1-enabled')?.checked ?? true,
@@ -1701,6 +1737,9 @@ async function pushConfigToServer() {
 
         if (response.ok) {
             console.log('[Config] Pushed to server successfully (incl. confirmations)');
+            // Update sidebar LP name
+            const sidebar = document.getElementById('sidebar-lp-name');
+            if (sidebar && lpName) sidebar.textContent = lpName;
         } else {
             console.error('[Config] Failed to push to server:', response.status);
         }
@@ -1786,6 +1825,9 @@ async function init() {
 
     // Check API status
     const connected = await checkApiStatus();
+
+    // Load LP identity (name, id) from server
+    await loadLPIdentity();
 
     // Refresh chain statuses (detect installed/running)
     await refreshChainStatuses();

@@ -40,6 +40,7 @@
             </nav>
 
             <div class="sidebar-footer">
+                <div id="sidebar-lp-name" style="font-weight:600; font-size:13px; margin-bottom:6px; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></div>
                 <div class="status-indicator">
                     <span class="status-dot" id="api-status"></span>
                     <span id="api-status-text">Connecting...</span>
@@ -287,11 +288,25 @@
             <!-- LP Config Page -->
             <section id="page-config" class="page">
                 <header class="page-header">
-                    <h1>LP Pricing Configuration</h1>
+                    <h1>LP Configuration</h1>
                     <div class="header-actions">
                         <button class="btn btn-secondary" onclick="refreshAllRates()">Refresh All Rates</button>
                     </div>
                 </header>
+
+                <!-- LP Identity -->
+                <div class="card" style="margin-bottom: 20px;">
+                    <h2>LP Identity</h2>
+                    <p class="card-desc">This name is displayed to users on P&A Swap when your LP is selected for a route.</p>
+                    <div class="form-group">
+                        <label>Display Name</label>
+                        <input type="text" id="lp-display-name" placeholder="My LP" maxlength="32">
+                    </div>
+                    <div class="form-group">
+                        <label>LP ID</label>
+                        <input type="text" id="lp-id-display" disabled style="opacity: 0.6;">
+                    </div>
+                </div>
 
                 <!-- Pair Pricing Cards -->
                 <div class="pair-config-grid">
@@ -718,6 +733,56 @@
                             <button class="btn btn-sm btn-icon" onclick="copyAddress('usdc')" title="Copy">&#128203;</button>
                         </div>
                     </div>
+                    <!-- PIVX -->
+                    <div class="wallet-card">
+                        <div class="wallet-header">
+                            <span class="wallet-icon" style="color: #6b3fa0">P</span>
+                            <h3>PIVX</h3>
+                            <button class="btn btn-sm btn-icon" onclick="refreshBalance('pivx')" title="Refresh">&#8635;</button>
+                        </div>
+                        <div class="wallet-balance">
+                            <span class="balance-value" id="wallet-pivx-balance">-</span>
+                            <span class="balance-unit">PIVX</span>
+                        </div>
+                        <div class="wallet-address-row">
+                            <code id="wallet-pivx-address" class="address-fixed">-</code>
+                            <button class="btn btn-sm btn-icon" onclick="copyAddress('pivx')" title="Copy">&#128203;</button>
+                        </div>
+                    </div>
+
+                    <!-- Dash -->
+                    <div class="wallet-card">
+                        <div class="wallet-header">
+                            <span class="wallet-icon" style="color: #008ce7">D</span>
+                            <h3>Dash</h3>
+                            <button class="btn btn-sm btn-icon" onclick="refreshBalance('dash')" title="Refresh">&#8635;</button>
+                        </div>
+                        <div class="wallet-balance">
+                            <span class="balance-value" id="wallet-dash-balance">-</span>
+                            <span class="balance-unit">DASH</span>
+                        </div>
+                        <div class="wallet-address-row">
+                            <code id="wallet-dash-address" class="address-fixed">-</code>
+                            <button class="btn btn-sm btn-icon" onclick="copyAddress('dash')" title="Copy">&#128203;</button>
+                        </div>
+                    </div>
+
+                    <!-- Zcash -->
+                    <div class="wallet-card">
+                        <div class="wallet-header">
+                            <span class="wallet-icon" style="color: #f4b728">Z</span>
+                            <h3>Zcash</h3>
+                            <button class="btn btn-sm btn-icon" onclick="refreshBalance('zec')" title="Refresh">&#8635;</button>
+                        </div>
+                        <div class="wallet-balance">
+                            <span class="balance-value" id="wallet-zec-balance">-</span>
+                            <span class="balance-unit">ZEC</span>
+                        </div>
+                        <div class="wallet-address-row">
+                            <code id="wallet-zec-address" class="address-fixed">-</code>
+                            <button class="btn btn-sm btn-icon" onclick="copyAddress('zec')" title="Copy">&#128203;</button>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="card" style="margin-top: 1.5rem;">
@@ -725,7 +790,8 @@
                     <p class="help-text">
                         • M1 balance includes all UTXOs for addresses labeled <code>lp_pna</code><br>
                         • Use "Reset" if address/balance mismatch - will re-query the node<br>
-                        • Use "Debug Info" to see detailed UTXO breakdown per address
+                        • Use "Debug Info" to see detailed UTXO breakdown per address<br>
+                        • PIVX/Dash/Zcash wallets load from <code>~/.BathronKey/</code> key files
                     </p>
                 </div>
             </section>

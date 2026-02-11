@@ -56,6 +56,9 @@ try:
     )
     from sdk.chains.btc import BTCClient, BTCConfig
     from sdk.chains.m1 import M1Client, M1Config
+    from sdk.chains.pivx import PIVXClient, PIVXConfig
+    from sdk.chains.dash import DASHClient, DASHConfig
+    from sdk.chains.zcash import ZECClient, ZECConfig
     from sdk.htlc.m1 import M1Htlc
     from sdk.htlc.m1_3s import M1Htlc3S
     from sdk.htlc.btc import BTCHtlc
@@ -109,6 +112,30 @@ ASSETS = {
         "htlc_type": "bathron_native",
         "confirmations_required": 1,
     },
+    "PIVX": {
+        "symbol": "PIVX",
+        "name": "PIVX",
+        "network": "PIVX Testnet",
+        "decimals": 8,
+        "htlc_type": "bitcoin_script",
+        "confirmations_required": 6,
+    },
+    "DASH": {
+        "symbol": "DASH",
+        "name": "Dash",
+        "network": "Dash Testnet",
+        "decimals": 8,
+        "htlc_type": "bitcoin_script",
+        "confirmations_required": 6,
+    },
+    "ZEC": {
+        "symbol": "ZEC",
+        "name": "Zcash",
+        "network": "Zcash Testnet",
+        "decimals": 8,
+        "htlc_type": "bitcoin_script",
+        "confirmations_required": 6,
+    },
 }
 
 # Mock rates (USD base) - Production: oracle/exchange feeds
@@ -116,6 +143,9 @@ RATES_USD = {
     "BTC": 98500.0,
     "USDC": 1.0,
     "M1": 1.0,
+    "PIVX": 0.25,
+    "DASH": 28.0,
+    "ZEC": 35.0,
 }
 
 # Settlement times (seconds)
@@ -123,6 +153,9 @@ SETTLEMENT_TIMES = {
     "BTC": 1200,   # ~20 min (6 conf)
     "USDC": 120,   # ~2 min
     "M1": 60,      # ~1 min (HU finality)
+    "PIVX": 360,   # ~6 min (6 conf × 1 min block)
+    "DASH": 900,   # ~15 min (6 conf × 2.5 min block)
+    "ZEC": 450,    # ~7.5 min (6 conf × 75s block)
 }
 
 # HTLC timeouts (seconds)
@@ -130,6 +163,9 @@ HTLC_TIMEOUTS = {
     "BTC": 6 * 3600,   # 6 hours
     "USDC": 2 * 3600,  # 2 hours
     "M1": 1 * 3600,    # 1 hour
+    "PIVX": 6 * 3600,  # 6 hours
+    "DASH": 6 * 3600,  # 6 hours
+    "ZEC": 6 * 3600,   # 6 hours
 }
 
 # =============================================================================
@@ -139,10 +175,23 @@ HTLC_TIMEOUTS = {
 # BTC/M1 is FIXED: 1 SAT = 1 M1, so 1 BTC = 100,000,000 M1
 BTC_M1_FIXED_RATE = 100_000_000  # sats per BTC = M1 per BTC
 
+# Load persisted LP name (falls back to env var, then default)
+def _load_lp_name():
+    lp_id = os.environ.get("LP_ID", "lp_pna_01")
+    name_file = os.path.expanduser(f"~/.bathron/lp_name_{lp_id}.txt")
+    try:
+        with open(name_file, "r") as f:
+            name = f.read().strip()
+            if name:
+                return name
+    except FileNotFoundError:
+        pass
+    return os.environ.get("LP_NAME", "pna LP")
+
 # Default LP config
 LP_CONFIG = {
     "id": os.environ.get("LP_ID", "lp_pna_01"),
-    "name": os.environ.get("LP_NAME", "pna LP"),
+    "name": _load_lp_name(),
     "version": "0.1.0",
     "endpoint": None,  # Set dynamically
     "pairs": {
@@ -161,6 +210,30 @@ LP_CONFIG = {
             "spread_ask": 0.5,  # % - user buys USDC
             "min": 1,           # USDC (testnet: low for testing)
             "max": 100000,      # USDC
+        },
+        "PIVX/M1": {
+            "enabled": True,
+            "rate": 25_000_000,  # M1 per PIVX (~$0.25)
+            "spread_bid": 1.0,
+            "spread_ask": 1.0,
+            "min": 1,
+            "max": 100000,
+        },
+        "DASH/M1": {
+            "enabled": True,
+            "rate": 2_800_000_000,  # M1 per DASH (~$28)
+            "spread_bid": 1.0,
+            "spread_ask": 1.0,
+            "min": 0.01,
+            "max": 1000,
+        },
+        "ZEC/M1": {
+            "enabled": True,
+            "rate": 3_500_000_000,  # M1 per ZEC (~$35)
+            "spread_bid": 1.0,
+            "spread_ask": 1.0,
+            "min": 0.01,
+            "max": 1000,
         },
         "BTC/USDC": {
             "enabled": True,
@@ -861,6 +934,12 @@ async def get_quote(
         inventory_ok = available.get("m1", 0) >= to_amount_coins
     elif to_asset == "USDC":
         inventory_ok = available.get("usdc", 0) >= to_amount_coins
+    elif to_asset == "PIVX":
+        inventory_ok = available.get("pivx", 0) >= to_amount_coins
+    elif to_asset == "DASH":
+        inventory_ok = available.get("dash", 0) >= to_amount_coins
+    elif to_asset == "ZEC":
+        inventory_ok = available.get("zec", 0) >= to_amount_coins
 
     # Check amount limits
     if amount < min_amount:
@@ -950,6 +1029,66 @@ async def get_quote_leg(
         min_amount = LP_CONFIG["pairs"]["USDC/M1"]["min"] * LP_CONFIG["pairs"]["USDC/M1"]["rate"]
         max_amount = LP_CONFIG["pairs"]["USDC/M1"]["max"] * LP_CONFIG["pairs"]["USDC/M1"]["rate"]
 
+    elif from_asset == "PIVX" and to_asset == "M1":
+        pivx_pair = LP_CONFIG["pairs"].get("PIVX/M1")
+        if not pivx_pair or not pivx_pair.get("enabled"):
+            raise HTTPException(400, "PIVX/M1 pair not enabled")
+        market_rate = float(pivx_pair["rate"])
+        spread_percent = pivx_pair["spread_bid"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = pivx_pair["min"]
+        max_amount = pivx_pair["max"]
+
+    elif from_asset == "M1" and to_asset == "PIVX":
+        pivx_pair = LP_CONFIG["pairs"].get("PIVX/M1")
+        if not pivx_pair or not pivx_pair.get("enabled"):
+            raise HTTPException(400, "PIVX/M1 pair not enabled")
+        market_rate = 1.0 / float(pivx_pair["rate"])
+        spread_percent = pivx_pair["spread_ask"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = pivx_pair["min"] * pivx_pair["rate"]
+        max_amount = pivx_pair["max"] * pivx_pair["rate"]
+
+    elif from_asset == "DASH" and to_asset == "M1":
+        dash_pair = LP_CONFIG["pairs"].get("DASH/M1")
+        if not dash_pair or not dash_pair.get("enabled"):
+            raise HTTPException(400, "DASH/M1 pair not enabled")
+        market_rate = float(dash_pair["rate"])
+        spread_percent = dash_pair["spread_bid"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = dash_pair["min"]
+        max_amount = dash_pair["max"]
+
+    elif from_asset == "M1" and to_asset == "DASH":
+        dash_pair = LP_CONFIG["pairs"].get("DASH/M1")
+        if not dash_pair or not dash_pair.get("enabled"):
+            raise HTTPException(400, "DASH/M1 pair not enabled")
+        market_rate = 1.0 / float(dash_pair["rate"])
+        spread_percent = dash_pair["spread_ask"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = dash_pair["min"] * dash_pair["rate"]
+        max_amount = dash_pair["max"] * dash_pair["rate"]
+
+    elif from_asset == "ZEC" and to_asset == "M1":
+        zec_pair = LP_CONFIG["pairs"].get("ZEC/M1")
+        if not zec_pair or not zec_pair.get("enabled"):
+            raise HTTPException(400, "ZEC/M1 pair not enabled")
+        market_rate = float(zec_pair["rate"])
+        spread_percent = zec_pair["spread_bid"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = zec_pair["min"]
+        max_amount = zec_pair["max"]
+
+    elif from_asset == "M1" and to_asset == "ZEC":
+        zec_pair = LP_CONFIG["pairs"].get("ZEC/M1")
+        if not zec_pair or not zec_pair.get("enabled"):
+            raise HTTPException(400, "ZEC/M1 pair not enabled")
+        market_rate = 1.0 / float(zec_pair["rate"])
+        spread_percent = zec_pair["spread_ask"]
+        effective_rate = market_rate * (1 - spread_percent / 100)
+        min_amount = zec_pair["min"] * zec_pair["rate"]
+        max_amount = zec_pair["max"] * zec_pair["rate"]
+
     else:
         raise HTTPException(400, f"Unsupported leg: {from_asset}/{to_asset}")
 
@@ -967,6 +1106,12 @@ async def get_quote_leg(
         inventory_ok = available.get("m1", 0) >= to_amount_coins
     elif to_asset == "USDC":
         inventory_ok = available.get("usdc", 0) >= to_amount_coins
+    elif to_asset == "PIVX":
+        inventory_ok = available.get("pivx", 0) >= to_amount_coins
+    elif to_asset == "DASH":
+        inventory_ok = available.get("dash", 0) >= to_amount_coins
+    elif to_asset == "ZEC":
+        inventory_ok = available.get("zec", 0) >= to_amount_coins
 
     # Check limits
     if amount < min_amount:
@@ -1386,6 +1531,14 @@ async def update_lp_config(config: LPConfigUpdate):
     """
     if config.name:
         LP_CONFIG["name"] = config.name
+        # Persist to disk so it survives restarts
+        try:
+            name_file = os.path.expanduser(f"~/.bathron/lp_name_{LP_CONFIG['id']}.txt")
+            os.makedirs(os.path.dirname(name_file), exist_ok=True)
+            with open(name_file, "w") as f:
+                f.write(config.name)
+        except Exception as e:
+            log.warning(f"Could not persist LP name: {e}")
         log.info(f"LP name updated: {config.name}")
 
     if config.pairs:
@@ -1501,6 +1654,39 @@ async def refresh_inventory():
     LP_CONFIG["inventory"]["btc"] = wallets.get("btc", {}).get("balance", 0)
     LP_CONFIG["inventory"]["usdc"] = wallets.get("usdc", {}).get("balance", 0)
 
+    # PIVX inventory from wallet
+    pivx_balance = 0
+    if SDK_AVAILABLE:
+        try:
+            pivx_client = get_pivx_client()
+            if pivx_client:
+                pivx_balance = pivx_client.get_balance()
+        except Exception as e:
+            log.warning(f"Error getting PIVX balance: {e}")
+    LP_CONFIG["inventory"]["pivx"] = pivx_balance
+
+    # DASH inventory
+    dash_balance = 0
+    if SDK_AVAILABLE:
+        try:
+            dash_client = get_dash_client()
+            if dash_client:
+                dash_balance = dash_client.get_balance()
+        except Exception as e:
+            log.warning(f"Error getting DASH balance: {e}")
+    LP_CONFIG["inventory"]["dash"] = dash_balance
+
+    # ZEC inventory
+    zec_balance = 0
+    if SDK_AVAILABLE:
+        try:
+            zec_client = get_zec_client()
+            if zec_client:
+                zec_balance = zec_client.get_balance()
+        except Exception as e:
+            log.warning(f"Error getting ZEC balance: {e}")
+    LP_CONFIG["inventory"]["zec"] = zec_balance
+
     # For M1, use SDK receipts (actual M1 liquidity available for swaps)
     m1_balance = 0
     if SDK_AVAILABLE:
@@ -1521,7 +1707,8 @@ async def refresh_inventory():
     LP_CONFIG["inventory"]["m1"] = m1_balance
 
     log.info(f"Inventory refreshed: BTC={LP_CONFIG['inventory']['btc']}, "
-             f"M1={LP_CONFIG['inventory']['m1']}, USDC={LP_CONFIG['inventory']['usdc']}")
+             f"M1={LP_CONFIG['inventory']['m1']}, USDC={LP_CONFIG['inventory']['usdc']}, "
+             f"PIVX={LP_CONFIG['inventory'].get('pivx', 0)}")
 
     with _flowswap_lock:
         available = _get_available_inventory()
@@ -2391,13 +2578,13 @@ def _release_reservation(swap_id: str):
 def _get_available_inventory() -> Dict[str, float]:
     """Get available inventory = wallet balance - sum(reservations). Caller must hold _flowswap_lock."""
     raw = LP_CONFIG.get("inventory", {})
-    totals = {"btc": 0.0, "m1": 0.0, "usdc": 0.0}
+    totals = {"btc": 0.0, "m1": 0.0, "usdc": 0.0, "pivx": 0.0, "dash": 0.0, "zec": 0.0}
     for res in _inventory_reservations.values():
         for asset, amount in res.items():
             totals[asset] = totals.get(asset, 0) + amount
     return {
         asset: max(0, raw.get(asset, 0) - totals.get(asset, 0))
-        for asset in ("btc", "m1", "usdc")
+        for asset in ("btc", "m1", "usdc", "pivx", "dash", "zec")
     }
 
 
@@ -5221,6 +5408,9 @@ chain_status_db: Dict[str, Dict[str, Any]] = {
     "btc": {"installed": False, "running": False, "height": 0, "pid": None},
     "m1": {"installed": False, "running": False, "height": 0, "pid": None},
     "usdc": {"installed": True, "running": False, "height": 0},  # No install needed
+    "pivx": {"installed": False, "running": False, "height": 0, "pid": None},
+    "dash": {"installed": False, "running": False, "height": 0, "pid": None},
+    "zcash": {"installed": False, "running": False, "height": 0, "pid": None},
 }
 
 install_jobs_db: Dict[str, Dict[str, Any]] = {}
@@ -5258,6 +5448,18 @@ CHAIN_BINARIES = {
         Path.home() / "BATHRON" / "src" / "bathrond",
         "/usr/local/bin/bathrond",
     ]),
+    "pivx": find_binary("pivxd", [
+        Path.home() / "pivx" / "bin" / "pivxd",
+        "/usr/local/bin/pivxd",
+    ]),
+    "dash": find_binary("dashd", [
+        Path.home() / "dash" / "bin" / "dashd",
+        "/usr/local/bin/dashd",
+    ]),
+    "zcash": find_binary("zcashd", [
+        Path.home() / "zcash" / "bin" / "zcashd",
+        "/usr/local/bin/zcashd",
+    ]),
 }
 
 CHAIN_CLI = {
@@ -5271,6 +5473,18 @@ CHAIN_CLI = {
         Path.home() / "bathron" / "bin" / "bathron-cli",       # deploy_to_vps.sh
         Path.home() / "BATHRON" / "src" / "bathron-cli",
         "/usr/local/bin/bathron-cli",
+    ]),
+    "pivx": find_binary("pivx-cli", [
+        Path.home() / "pivx" / "bin" / "pivx-cli",
+        "/usr/local/bin/pivx-cli",
+    ]),
+    "dash": find_binary("dash-cli", [
+        Path.home() / "dash" / "bin" / "dash-cli",
+        "/usr/local/bin/dash-cli",
+    ]),
+    "zcash": find_binary("zcash-cli", [
+        Path.home() / "zcash" / "bin" / "zcash-cli",
+        "/usr/local/bin/zcash-cli",
     ]),
 }
 
@@ -5312,6 +5526,9 @@ check_chain_status_on_startup()
 # SDK clients (initialized lazily)
 _sdk_m1_client: Optional["M1Client"] = None
 _sdk_btc_client: Optional["BTCClient"] = None
+_sdk_pivx_client: Optional["PIVXClient"] = None
+_sdk_dash_client: Optional["DASHClient"] = None
+_sdk_zec_client: Optional["ZECClient"] = None
 _sdk_m1_htlc: Optional["M1Htlc"] = None
 _sdk_btc_htlc: Optional["BTCHtlc"] = None
 
@@ -5367,6 +5584,87 @@ def get_btc_client() -> "BTCClient":
         _sdk_btc_client = BTCClient(config)
         log.info(f"SDK BTC client initialized (wallet={btc_wallet_name or 'default'})")
     return _sdk_btc_client
+
+def _load_lp_pivx_key() -> Dict:
+    """Load PIVX key from ~/.BathronKey/pivx.json."""
+    key_path = Path.home() / ".BathronKey" / "pivx.json"
+    if not key_path.exists():
+        return {}
+    try:
+        with open(key_path) as f:
+            return json.load(f)
+    except Exception as e:
+        log.error(f"Failed to load PIVX key: {e}")
+        return {}
+
+def get_pivx_client() -> "PIVXClient":
+    """Get or create PIVX client."""
+    global _sdk_pivx_client
+    if _sdk_pivx_client is None and SDK_AVAILABLE:
+        pivx_key = _load_lp_pivx_key()
+        config = PIVXConfig(
+            network="testnet",
+            cli_path=CHAIN_CLI.get("pivx"),
+            rpc_user=pivx_key.get("rpc_user", ""),
+            rpc_password=pivx_key.get("rpc_password", ""),
+        )
+        _sdk_pivx_client = PIVXClient(config)
+        log.info("SDK PIVX client initialized")
+    return _sdk_pivx_client
+
+def _load_lp_dash_key() -> Dict:
+    """Load Dash key from ~/.BathronKey/dash.json."""
+    key_path = Path.home() / ".BathronKey" / "dash.json"
+    if not key_path.exists():
+        return {}
+    try:
+        with open(key_path) as f:
+            return json.load(f)
+    except Exception as e:
+        log.error(f"Failed to load Dash key: {e}")
+        return {}
+
+def get_dash_client() -> "DASHClient":
+    """Get or create Dash client."""
+    global _sdk_dash_client
+    if _sdk_dash_client is None and SDK_AVAILABLE:
+        dash_key = _load_lp_dash_key()
+        config = DASHConfig(
+            network="testnet",
+            cli_path=CHAIN_CLI.get("dash"),
+            rpc_user=dash_key.get("rpc_user", ""),
+            rpc_password=dash_key.get("rpc_password", ""),
+        )
+        _sdk_dash_client = DASHClient(config)
+        log.info("SDK Dash client initialized")
+    return _sdk_dash_client
+
+def _load_lp_zec_key() -> Dict:
+    """Load Zcash key from ~/.BathronKey/zcash.json."""
+    key_path = Path.home() / ".BathronKey" / "zcash.json"
+    if not key_path.exists():
+        return {}
+    try:
+        with open(key_path) as f:
+            return json.load(f)
+    except Exception as e:
+        log.error(f"Failed to load Zcash key: {e}")
+        return {}
+
+def get_zec_client() -> "ZECClient":
+    """Get or create Zcash client."""
+    global _sdk_zec_client
+    if _sdk_zec_client is None and SDK_AVAILABLE:
+        zec_key = _load_lp_zec_key()
+        config = ZECConfig(
+            network="testnet",
+            cli_path=CHAIN_CLI.get("zcash"),
+            rpc_user=zec_key.get("rpc_user", ""),
+            rpc_password=zec_key.get("rpc_password", ""),
+        )
+        _sdk_zec_client = ZECClient(config)
+        log.info("SDK Zcash client initialized")
+    return _sdk_zec_client
 
 def get_m1_htlc() -> "M1Htlc":
     """Get or create M1 HTLC manager."""
@@ -6311,6 +6609,32 @@ async def get_wallets():
     except Exception as e:
         log.error(f"Error getting USDC balance: {e}")
 
+    # ── PIVX / Dash / Zcash wallets ──────────────────────────────────────────
+    chain_wallet_configs = [
+        ("pivx", get_pivx_client, _load_lp_pivx_key),
+        ("dash", get_dash_client, _load_lp_dash_key),
+        ("zec", get_zec_client, _load_lp_zec_key),
+    ]
+    for chain_key, get_client_fn, load_key_fn in chain_wallet_configs:
+        wallets[chain_key] = {"address": None, "balance": None}
+        try:
+            key_data = load_key_fn()
+            if key_data:
+                addr = key_data.get("address")
+                if addr and addr != "pending":
+                    wallets[chain_key]["address"] = addr
+                else:
+                    wallets[chain_key]["address"] = None
+                try:
+                    client = get_client_fn()
+                    if client:
+                        bal = client.get_balance()
+                        wallets[chain_key]["balance"] = float(bal) if bal is not None else None
+                except Exception as e:
+                    log.warning(f"{chain_key} balance fetch failed (node syncing?): {e}")
+        except Exception as e:
+            log.warning(f"{chain_key} wallet load failed: {e}")
+
     return wallets
 
 
@@ -6484,7 +6808,7 @@ async def reset_wallet_address(chain: str = Query(...)):
     """
     global _lp_addresses
 
-    if chain not in ["btc", "m1", "usdc"]:
+    if chain not in ["btc", "m1", "usdc", "pivx", "dash", "zec"]:
         raise HTTPException(400, f"Unknown chain: {chain}")
 
     old_address = _lp_addresses.get(chain)
@@ -6512,7 +6836,7 @@ async def set_wallet_address(chain: str = Query(...), address: str = Query(...))
     """
     global _lp_addresses
 
-    if chain not in ["btc", "m1", "usdc"]:
+    if chain not in ["btc", "m1", "usdc", "pivx", "dash", "zec"]:
         raise HTTPException(400, f"Unknown chain: {chain}")
 
     # Validate address format
@@ -6520,14 +6844,18 @@ async def set_wallet_address(chain: str = Query(...), address: str = Query(...))
         if not address.startswith("0x") or len(address) != 42:
             raise HTTPException(400, "Invalid Ethereum address format")
     elif chain == "btc":
-        # BTC addresses: start with tb1 (segwit) or 2/m/n (testnet legacy)
         if not (address.startswith("tb1") or address.startswith("2") or
                 address.startswith("m") or address.startswith("n")):
             raise HTTPException(400, "Invalid Bitcoin Signet address format")
     elif chain == "m1":
-        # BATHRON addresses start with y
         if not address.startswith("y"):
             raise HTTPException(400, "Invalid BATHRON address format")
+    elif chain in ("pivx", "dash"):
+        if not address.startswith("y") and not address.startswith("Y"):
+            raise HTTPException(400, f"Invalid {chain.upper()} testnet address format")
+    elif chain == "zec":
+        if not address.startswith("t"):
+            raise HTTPException(400, "Invalid Zcash testnet address format")
 
     old_address = _lp_addresses.get(chain)
     _lp_addresses[chain] = address
@@ -6544,6 +6872,54 @@ async def set_wallet_address(chain: str = Query(...), address: str = Query(...))
         "new_address": address,
         "balance": wallets.get(chain, {}).get("balance", 0),
     }
+
+
+@app.post("/api/wallets/generate-address")
+async def generate_wallet_address(chain: str = Query(...)):
+    """
+    Generate a new wallet address for a chain.
+    Works for PIVX, Dash, Zcash — calls getnewaddress on the local daemon.
+    Updates the key file in ~/.BathronKey/.
+    """
+    chain_config = {
+        "pivx": (get_pivx_client, _load_lp_pivx_key, "pivx"),
+        "dash": (get_dash_client, _load_lp_dash_key, "dash"),
+        "zec": (get_zec_client, _load_lp_zec_key, "zcash"),
+    }
+    if chain not in chain_config:
+        raise HTTPException(400, f"Address generation not supported for: {chain}")
+
+    get_client_fn, load_key_fn, key_name = chain_config[chain]
+
+    try:
+        client = get_client_fn()
+        if not client:
+            raise HTTPException(503, f"{chain} client not available — check key file")
+
+        address = client.get_new_address()
+        if not address:
+            raise HTTPException(503, f"{chain} getnewaddress failed — node may still be syncing")
+
+        # Update the key file
+        key_path = Path.home() / ".BathronKey" / f"{key_name}.json"
+        try:
+            with open(key_path) as f:
+                key_data = json.load(f)
+        except Exception:
+            key_data = {}
+        key_data["address"] = address
+        with open(key_path, "w") as f:
+            json.dump(key_data, f, indent=4)
+        key_path.chmod(0o600)
+
+        log.info(f"Generated new {chain} address: {address}")
+        return {"chain": chain, "address": address}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Failed to generate {chain} address: {e}")
+        raise HTTPException(500, f"Failed: {e}")
 
 
 # =============================================================================
@@ -8902,7 +9278,8 @@ async def startup_event():
     try:
         await refresh_inventory()
         log.info(f"Inventory loaded: BTC={LP_CONFIG['inventory']['btc']}, "
-                 f"M1={LP_CONFIG['inventory']['m1']}, USDC={LP_CONFIG['inventory']['usdc']}")
+                 f"M1={LP_CONFIG['inventory']['m1']}, USDC={LP_CONFIG['inventory']['usdc']}, "
+                 f"PIVX={LP_CONFIG['inventory'].get('pivx', 0)}")
     except Exception as e:
         log.warning(f"Could not refresh inventory on startup: {e}")
 
