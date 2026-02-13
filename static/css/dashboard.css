@@ -993,9 +993,96 @@ body {
     margin-bottom: 8px;
 }
 
+.wallet-status-badge {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 2px 8px;
+    border-radius: 10px;
+    white-space: nowrap;
+}
+
+.wallet-status-badge.connected {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--success);
+}
+
+.wallet-status-badge.syncing {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--warning);
+}
+
+.wallet-status-badge.disconnected {
+    background: rgba(107, 114, 128, 0.15);
+    color: var(--text-muted);
+}
+
+.wallet-actions-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+}
+
 .wallet-actions {
     display: flex;
+    gap: 6px;
+}
+
+.btn-danger {
+    background: transparent;
+    color: var(--error);
+    border: 1px solid var(--error);
+}
+
+.btn-danger:hover {
+    background: rgba(239, 68, 68, 0.1);
+}
+
+/* Not-installed chains compact section */
+.wallet-not-installed-section {
+    grid-column: 1 / -1;
+    margin-top: 8px;
+    padding: 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+}
+
+.wallet-not-installed-section h4 {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.wallet-not-installed-list {
+    display: flex;
+    flex-direction: column;
     gap: 8px;
+}
+
+.wallet-not-installed-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--bg-input);
+    border-radius: 8px;
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+.wallet-not-installed-item span:nth-child(2) {
+    flex: 1;
+}
+
+.wallet-icon-sm {
+    font-size: 16px;
+    font-weight: 700;
+    width: 24px;
+    text-align: center;
 }
 
 /* Status badges */
@@ -1912,6 +1999,344 @@ select {
     border-radius: 4px;
 }
 
+/* Pricing Tables */
+.pricing-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.pricing-table th {
+    text-align: left;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.pricing-table td {
+    padding: 10px 12px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+}
+
+.pricing-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.pricing-table tbody tr:hover {
+    background: var(--bg-secondary);
+}
+
+.pricing-table .pair-tag {
+    display: inline-block;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+
+.pricing-table .pair-tag.fixed {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--success);
+}
+
+.pricing-table .pair-tag.derived {
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--accent);
+}
+
+.pricing-table .rate-val {
+    font-family: monospace;
+    color: var(--success);
+    font-weight: 500;
+}
+
+.pricing-table .rate-age {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-left: 4px;
+}
+
+.pricing-note {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+
+.inline-input {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.inline-input input {
+    width: 80px;
+    padding: 5px 8px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+    text-align: right;
+}
+
+.inline-input input:focus {
+    border-color: var(--accent);
+    outline: none;
+}
+
+.inline-input span {
+    font-size: 11px;
+    color: var(--text-muted);
+    min-width: 28px;
+}
+
+.card-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.card-header-row h2 {
+    margin: 0;
+}
+
+.settings-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+}
+
+.settings-col h4 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 12px;
+}
+
+.settings-col h4 .config-hint {
+    font-weight: 400;
+}
+
+.settings-col .checkbox-label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.settings-col .checkbox-label input {
+    margin-right: 6px;
+    accent-color: var(--accent);
+}
+
+.form-group.compact {
+    margin-bottom: 8px;
+}
+
+.form-group.compact label {
+    font-size: 11px;
+    display: block;
+    margin-bottom: 3px;
+}
+
+.form-group.compact input,
+.form-group.compact select {
+    padding: 6px 8px;
+    font-size: 13px;
+}
+
+/* =============================================================================
+   SETTLEMENT DESK TABLE
+   ============================================================================= */
+
+.settlement-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.settlement-table thead th {
+    text-align: left;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.settlement-table .col-arrow {
+    width: 32px;
+    text-align: center;
+}
+
+.settlement-table .col-rate {
+    font-family: 'SF Mono', Monaco, monospace;
+}
+
+.settlement-table .col-spread {
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+/* Pair row (clickable) */
+.pair-row {
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.pair-row td {
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+    vertical-align: middle;
+}
+
+.pair-row:hover {
+    background: var(--bg-secondary);
+}
+
+.pair-row.expanded {
+    background: var(--bg-secondary);
+}
+
+.pair-row.expanded td {
+    border-bottom-color: transparent;
+}
+
+/* Expand arrow */
+.expand-arrow {
+    display: inline-block;
+    font-size: 12px;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+}
+
+.pair-row.expanded .expand-arrow {
+    color: var(--accent);
+}
+
+/* Chain icon inline */
+.pair-chain-icon {
+    font-weight: 700;
+    font-size: 16px;
+    margin-right: 6px;
+}
+
+/* Rate formatting */
+.rate-fixed {
+    color: var(--success);
+    font-family: 'SF Mono', Monaco, monospace;
+    font-weight: 500;
+}
+
+.rate-market {
+    color: var(--text-primary);
+    font-family: 'SF Mono', Monaco, monospace;
+    font-weight: 500;
+}
+
+/* Pair tags */
+.pair-tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+
+.pair-tag.fixed {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--success);
+}
+
+.pair-tag.market {
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--accent);
+}
+
+.pair-tag.not-installed {
+    background: rgba(107, 114, 128, 0.15);
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* Disabled pair row (chain not installed) */
+.pair-row.disabled {
+    cursor: default;
+}
+
+.pair-row.disabled:hover {
+    background: transparent;
+}
+
+/* Accordion detail panel */
+.pair-detail-row td {
+    padding: 0 12px 12px 12px;
+    border-bottom: 1px solid var(--border);
+}
+
+.pair-detail-panel {
+    background: var(--bg-input);
+    border-radius: 8px;
+    padding: 16px;
+}
+
+.pair-detail-section {
+    margin-bottom: 16px;
+}
+
+.pair-detail-section:last-child {
+    margin-bottom: 0;
+}
+
+.pair-detail-section h4 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 10px;
+}
+
+/* Fixed rate box */
+.fixed-rate-box {
+    padding: 12px 16px;
+    background: rgba(16, 185, 129, 0.1);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    border-radius: 6px;
+    color: var(--success);
+    font-weight: 600;
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 14px;
+}
+
+/* Detail fields grid (spread + limits) */
+.detail-fields {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+}
+
+.detail-field label {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+
 /* Responsive */
 @media (max-width: 1200px) {
     .stats-grid {
@@ -1927,6 +2352,14 @@ select {
     }
 
     .pair-config-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .detail-fields {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .settings-grid {
         grid-template-columns: 1fr;
     }
 

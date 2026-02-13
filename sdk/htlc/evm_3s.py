@@ -17,6 +17,23 @@ from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
+# RPC settings
+RPC_TIMEOUT = 15  # seconds per RPC call
+RPC_RETRY_ATTEMPTS = 3
+RPC_RETRY_BACKOFF = 1.0  # seconds, doubles each attempt
+
+# Fallback RPC endpoints for Base Sepolia
+RPC_FALLBACKS = [
+    "https://sepolia.base.org",
+    "https://base-sepolia-rpc.publicnode.com",
+]
+
+
+class EVMRPCError(Exception):
+    """RPC communication error (timeout, connection refused, etc.)
+    Distinct from 'HTLC not found' which returns None."""
+    pass
+
 # Contract deployment info (to be updated after deploy)
 HTLC3S_CONTRACT_ADDRESS = "0x2493EaaaBa6B129962c8967AaEE6bF11D0277756"
 
@@ -179,23 +196,40 @@ class EVMHTLC3S:
 
     @property
     def web3(self):
-        """Lazy-load web3 instance."""
+        """Lazy-load web3 instance with timeout."""
         if self._web3 is None:
             from web3 import Web3
-            self._web3 = Web3(Web3.HTTPProvider(self.rpc_url))
+            self._web3 = Web3(Web3.HTTPProvider(
+                self.rpc_url,
+                request_kwargs={"timeout": RPC_TIMEOUT}
+            ))
         return self._web3
+
+    def _reset_web3(self, rpc_url: str = None):
+        """Reset web3 instance, optionally with a new RPC URL."""
+        from web3 import Web3
+        if rpc_url:
+            self.rpc_url = rpc_url
+        self._web3 = Web3(Web3.HTTPProvider(
+            self.rpc_url,
+            request_kwargs={"timeout": RPC_TIMEOUT}
+        ))
 
     def get_htlc(self, htlc_id: str) -> Optional[HTLC3SInfo]:
         """
-        Get HTLC details.
+        Get HTLC details from on-chain contract.
 
         Args:
             htlc_id: HTLC identifier (bytes32 hex)
 
         Returns:
-            HTLC3SInfo or None if not found
+            HTLC3SInfo if found, None if HTLC does not exist on-chain.
+
+        Raises:
+            EVMRPCError: If RPC communication fails (timeout, connection, etc.)
         """
         from web3 import Web3
+        from web3.exceptions import ContractLogicError
 
         try:
             contract = self.web3.eth.contract(
@@ -210,7 +244,7 @@ class EVMHTLC3S:
 
             sender, recipient, token, amount, H_user, H_lp1, H_lp2, timelock, claimed, refunded = result
 
-            # Check if HTLC exists
+            # Check if HTLC exists (zero sender = never created)
             if sender == "0x" + "0" * 40:
                 return None
 
@@ -241,9 +275,73 @@ class EVMHTLC3S:
                 status=status,
             )
 
-        except Exception as e:
-            log.error(f"Failed to get HTLC: {e}")
+        except ContractLogicError:
+            # Contract revert = HTLC genuinely not found
+            log.warning(f"get_htlc({htlc_id[:18]}...): contract revert (not found)")
             return None
+        except (ConnectionError, TimeoutError, OSError) as e:
+            log.error(f"get_htlc({htlc_id[:18]}...): RPC connection error: {e}")
+            raise EVMRPCError(f"RPC connection failed: {e}") from e
+        except Exception as e:
+            err_str = str(e).lower()
+            # Distinguish RPC/network errors from contract-level "not found"
+            if any(kw in err_str for kw in (
+                "timeout", "connection", "refused", "unreachable",
+                "503", "502", "429", "rate limit", "provider",
+                "could not connect", "max retries",
+            )):
+                log.error(f"get_htlc({htlc_id[:18]}...): RPC error: {e}")
+                raise EVMRPCError(f"RPC error: {e}") from e
+            # Unknown exception — log full traceback, treat as RPC error
+            # (safer to retry than to falsely report "not found")
+            log.exception(f"get_htlc({htlc_id[:18]}...): unexpected error")
+            raise EVMRPCError(f"Unexpected RPC error: {e}") from e
+
+    def get_htlc_with_retry(
+        self, htlc_id: str,
+        attempts: int = RPC_RETRY_ATTEMPTS,
+        backoff: float = RPC_RETRY_BACKOFF,
+    ) -> Optional[HTLC3SInfo]:
+        """
+        Get HTLC with retry + fallback RPC endpoints.
+
+        Thread-safe: restores original RPC URL after completion.
+
+        Returns:
+            HTLC3SInfo if found, None if genuinely not found.
+
+        Raises:
+            EVMRPCError: If all attempts on all RPC endpoints fail.
+        """
+        original_rpc = self.rpc_url
+        original_web3 = self._web3
+        endpoints = [self.rpc_url] + [u for u in RPC_FALLBACKS if u != self.rpc_url]
+        last_error = None
+
+        try:
+            for rpc_url in endpoints:
+                if rpc_url != original_rpc:
+                    log.info(f"Trying fallback RPC: {rpc_url}")
+                    self._reset_web3(rpc_url)
+
+                for attempt in range(1, attempts + 1):
+                    try:
+                        return self.get_htlc(htlc_id)
+                    except EVMRPCError as e:
+                        last_error = e
+                        wait = backoff * (2 ** (attempt - 1))
+                        log.warning(f"get_htlc attempt {attempt}/{attempts} failed "
+                                    f"(rpc={rpc_url}): {e} — retry in {wait:.1f}s")
+                        time.sleep(wait)
+        finally:
+            # Restore original RPC state (thread safety)
+            self.rpc_url = original_rpc
+            self._web3 = original_web3
+
+        raise EVMRPCError(
+            f"All {attempts} attempts on {len(endpoints)} RPC endpoints failed. "
+            f"Last error: {last_error}"
+        )
 
     def can_claim(
         self,

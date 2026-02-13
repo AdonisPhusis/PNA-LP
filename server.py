@@ -557,6 +557,8 @@ from routes.prices import (
     fetch_live_btc_usdc_price,
     configure as configure_prices,
     close_httpx_client as close_prices_httpx,
+    set_api_keys as set_prices_api_keys,
+    get_api_keys_status as get_prices_api_keys_status,
 )
 app.include_router(prices_router)
 
@@ -1470,6 +1472,11 @@ async def get_lp_info():
                           LP_CONFIG["pairs"]["BTC/M1"]["spread_ask"])
             bid_rate = base_rate * (1 - spread_buy / 100)
             ask_rate = base_rate * (1 + spread_sell / 100)
+        elif pair_key.endswith("/M1"):
+            # Generic X/M1 pair (PIVX, DASH, ZEC, etc.)
+            base_rate = float(pair_config.get("rate", 0))
+            bid_rate = base_rate * (1 - pair_config.get("spread_bid", 0) / 100)
+            ask_rate = base_rate * (1 + pair_config.get("spread_ask", 0) / 100)
         else:
             continue
 
@@ -1560,6 +1567,50 @@ async def update_lp_config(config: LPConfigUpdate):
                 log.info(f"Confirmation config updated: {asset} = {conf_data}")
 
     return {"success": True, "config": LP_CONFIG}
+
+
+# ---------------------------------------------------------------------------
+# API Keys management (secure, separate from LP config)
+# ---------------------------------------------------------------------------
+
+class APIKeysUpdate(BaseModel):
+    """API keys update from dashboard. All fields optional."""
+    binance_api_key: Optional[str] = None
+    binance_api_secret: Optional[str] = None
+    coingecko_api_key: Optional[str] = None
+    kraken_api_key: Optional[str] = None
+
+
+@app.post("/api/lp/api-keys")
+async def update_api_keys(keys: APIKeysUpdate):
+    """Update API keys from dashboard.
+
+    Persists to ~/.BathronKey/api_keys.json and updates the price module.
+    Keys are NEVER logged or returned in full.
+    """
+    keys_dict = {k: v for k, v in keys.dict().items() if v is not None}
+    if not keys_dict:
+        return {"success": True, "message": "No keys provided"}
+
+    # Update in-memory first (always works), then persist to disk
+    set_prices_api_keys(keys_dict)
+    try:
+        _save_api_keys(keys_dict)
+    except Exception as e:
+        log.error(f"Failed to persist API keys to disk: {e}")
+        return {"success": True, "keys_configured": [k for k, v in keys_dict.items() if v],
+                "warning": "Keys active in memory but disk persistence failed"}
+
+    return {
+        "success": True,
+        "keys_configured": [k for k, v in keys_dict.items() if v],
+    }
+
+
+@app.get("/api/lp/api-keys/status")
+async def api_keys_status():
+    """Get which API keys are configured (boolean only, never exposes values)."""
+    return {"keys": get_prices_api_keys_status()}
 
 
 @app.get("/api/lp/confirmations")
@@ -2432,6 +2483,53 @@ def _load_evm_private_key() -> Optional[str]:
 
     log.error("No EVM private key found in ~/.keys/lp_evm.json or ~/.BathronKey/evm.json")
     return None
+
+
+def _load_api_keys() -> Dict[str, str]:
+    """Load API keys from ~/.BathronKey/api_keys.json.
+
+    Keys: binance_api_key, binance_api_secret, coingecko_api_key, kraken_api_key.
+    NEVER log actual key values — only key names.
+    """
+    key_path = Path.home() / ".BathronKey" / "api_keys.json"
+    if not key_path.exists():
+        log.info("No API keys file at ~/.BathronKey/api_keys.json (optional)")
+        return {}
+    try:
+        with open(key_path) as f:
+            data = json.load(f)
+        loaded = {k: v for k, v in data.items() if v}
+        log.info(f"API keys loaded from {key_path}: {list(loaded.keys())}")
+        return loaded
+    except Exception as e:
+        log.error(f"Failed to load API keys from {key_path}: {e}")
+        return {}
+
+
+def _save_api_keys(keys: Dict[str, str]):
+    """Persist API keys to ~/.BathronKey/api_keys.json.
+
+    Merges with existing keys. Ensures 600/700 permissions.
+    """
+    key_path = Path.home() / ".BathronKey" / "api_keys.json"
+    key_dir = key_path.parent
+    key_dir.mkdir(mode=0o700, exist_ok=True)
+
+    existing = {}
+    if key_path.exists():
+        try:
+            with open(key_path) as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+
+    existing.update(keys)
+    existing = {k: v for k, v in existing.items() if v}
+
+    with open(key_path, "w") as f:
+        json.dump(existing, f, indent=2)
+    key_path.chmod(0o600)
+    log.info(f"API keys persisted to {key_path}: {list(existing.keys())}")
 
 
 def _get_btc_m1_usdc_rate() -> float:
@@ -4220,7 +4318,12 @@ async def flowswap_usdc_funded(swap_id: str, body: USDCFundedRequest = None):
     if not evm_htlc:
         raise HTTPException(503, "EVM client unavailable. Cannot verify USDC HTLC. Try again later.")
 
-    htlc_info = evm_htlc.get_htlc(htlc_id)
+    from sdk.htlc.evm_3s import EVMRPCError
+    try:
+        htlc_info = evm_htlc.get_htlc_with_retry(htlc_id)
+    except EVMRPCError as e:
+        log.error(f"FlowSwap {swap_id}: EVM RPC failure verifying HTLC {htlc_id}: {e}")
+        raise HTTPException(503, f"EVM RPC unavailable: {e}. Your USDC HTLC may exist — retry later.")
     if not htlc_info:
         raise HTTPException(400, f"USDC HTLC {htlc_id} not found on-chain. Wait for TX confirmation.")
 
@@ -5415,6 +5518,26 @@ chain_status_db: Dict[str, Dict[str, Any]] = {
 
 install_jobs_db: Dict[str, Dict[str, Any]] = {}
 
+# Chains explicitly uninstalled by user — persisted to disk for multi-worker support
+_UNINSTALLED_FILE = Path.home() / ".bathron" / "uninstalled_chains.json"
+
+def _load_uninstalled() -> set:
+    """Load uninstalled chains set from disk."""
+    try:
+        if _UNINSTALLED_FILE.exists():
+            return set(json.loads(_UNINSTALLED_FILE.read_text()))
+    except:
+        pass
+    return set()
+
+def _save_uninstalled(chains: set):
+    """Persist uninstalled chains set to disk."""
+    try:
+        _UNINSTALLED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _UNINSTALLED_FILE.write_text(json.dumps(list(chains)))
+    except:
+        pass
+
 # Script paths
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
 INSTALL_SCRIPTS = {
@@ -5765,6 +5888,11 @@ async def install_chain(chain: str):
     if chain not in ["btc", "m1"]:
         raise HTTPException(400, f"Chain {chain} does not need installation")
 
+    # Clear uninstall flag if user re-installs
+    uc = _load_uninstalled()
+    uc.discard(chain)
+    _save_uninstalled(uc)
+
     # Check if binary already exists
     if CHAIN_BINARIES[chain].exists():
         chain_status_db[chain]["installed"] = True
@@ -5917,6 +6045,29 @@ async def stop_chain(chain: str):
             except:
                 pass
         return {"stopped": False, "error": str(e)}
+
+@app.post("/api/chain/{chain}/uninstall")
+async def uninstall_chain(chain: str):
+    """Mark a chain as uninstalled (stops daemon, keeps data on disk)."""
+    supported = ["btc", "m1", "pivx", "dash", "zcash"]
+    if chain not in supported:
+        raise HTTPException(400, f"Unsupported chain: {chain}")
+
+    # Stop daemon first if running
+    if chain_status_db[chain].get("running"):
+        try:
+            await stop_chain(chain)
+        except:
+            pass
+
+    chain_status_db[chain]["installed"] = False
+    chain_status_db[chain]["running"] = False
+    chain_status_db[chain]["pid"] = None
+    uc = _load_uninstalled()
+    uc.add(chain)
+    _save_uninstalled(uc)
+    log.info(f"Chain uninstalled (marked): {chain}")
+    return {"uninstalled": True, "chain": chain}
 
 @app.get("/api/chain/{chain}/sync")
 async def get_chain_sync_status(chain: str):
@@ -6252,8 +6403,17 @@ async def debug_usdc_htlc():
 @app.get("/api/chains/status")
 async def get_all_chains_status():
     """Get status of all chains (refreshes installed/running status)."""
+    # Load persistent uninstall set (shared across workers)
+    uninstalled = _load_uninstalled()
     # Re-check installation and running status
     for chain in ["btc", "m1", "pivx", "dash", "zcash"]:
+        # Respect explicit user uninstall — don't override with binary detection
+        if chain in uninstalled:
+            chain_status_db[chain]["installed"] = False
+            chain_status_db[chain]["running"] = False
+            chain_status_db[chain]["pid"] = None
+            continue
+
         binary = CHAIN_BINARIES.get(chain)
         if binary and binary.exists():
             chain_status_db[chain]["installed"] = True
@@ -9280,10 +9440,14 @@ async def startup_event():
     else:
         log.warning("EVM private key NOT loaded — EVM operations will fail")
 
+    # Load API keys from secure storage (optional)
+    _startup_api_keys = _load_api_keys()
+
     # Configure price module with callback to update LP_CONFIG
     def _on_price_update(btc_price, usdc_m1_rate):
         LP_CONFIG["pairs"]["USDC/M1"]["rate"] = usdc_m1_rate
-    configure_prices(BTC_M1_FIXED_RATE, _on_price_update)
+    configure_prices(BTC_M1_FIXED_RATE, _on_price_update,
+                     api_keys=_startup_api_keys)
 
     # Fetch initial live price and update LP_CONFIG
     try:

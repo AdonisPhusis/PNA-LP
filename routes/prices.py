@@ -52,12 +52,52 @@ async def close_httpx_client():
 _on_price_update = None  # callback(btc_price, usdc_m1_rate)
 _btc_m1_fixed_rate = 100_000_000  # default, overridden by server.py
 
+# API keys for authenticated access (loaded from ~/.BathronKey/api_keys.json)
+_api_keys: Dict[str, str] = {}
 
-def configure(btc_m1_fixed_rate: int, on_price_update=None):
+
+def configure(btc_m1_fixed_rate: int, on_price_update=None,
+              api_keys: Optional[Dict[str, str]] = None):
     """Configure price module. Called once at startup by server.py."""
-    global _btc_m1_fixed_rate, _on_price_update
+    global _btc_m1_fixed_rate, _on_price_update, _api_keys
     _btc_m1_fixed_rate = btc_m1_fixed_rate
     _on_price_update = on_price_update
+    if api_keys:
+        _api_keys = {k: v for k, v in api_keys.items() if v}
+        log.info(f"API keys configured: {[k for k in _api_keys]}")
+
+
+def set_api_keys(keys: Dict[str, str]):
+    """Update API keys at runtime (e.g. from dashboard POST)."""
+    global _api_keys
+    _api_keys.update({k: v for k, v in keys.items() if v})
+    _api_keys = {k: v for k, v in _api_keys.items() if v}
+    log.info(f"API keys updated: {[k for k in _api_keys]}")
+    # Update price_sources_config visibility (boolean only)
+    for source in price_sources_config:
+        key_name = f"{source}_api_key"
+        price_sources_config[source]["api_key"] = bool(_api_keys.get(key_name))
+
+
+def get_api_keys_status() -> Dict[str, bool]:
+    """Return which API keys are configured (never expose actual values)."""
+    return {
+        "binance": bool(_api_keys.get("binance_api_key")),
+        "coingecko": bool(_api_keys.get("coingecko_api_key")),
+        "kraken": bool(_api_keys.get("kraken_api_key")),
+    }
+
+
+def _get_headers_for_domain(domain: str) -> Dict[str, str]:
+    """Return authentication headers for a given API domain."""
+    headers: Dict[str, str] = {}
+    if "binance.com" in domain and _api_keys.get("binance_api_key"):
+        headers["X-MBX-APIKEY"] = _api_keys["binance_api_key"]
+    elif "coingecko.com" in domain and _api_keys.get("coingecko_api_key"):
+        headers["x-cg-pro-api-key"] = _api_keys["coingecko_api_key"]
+    elif "kraken.com" in domain and _api_keys.get("kraken_api_key"):
+        headers["API-Key"] = _api_keys["kraken_api_key"]
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +115,10 @@ async def fetch_live_btc_usdc_price() -> float:
     try:
         client = _get_httpx_client()
         response = await asyncio.wait_for(
-            client.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDC"),
+            client.get(
+                "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDC",
+                headers=_get_headers_for_domain("binance.com"),
+            ),
             timeout=5.0
         )
         response.raise_for_status()
@@ -166,38 +209,75 @@ async def get_price_sources():
     return {"sources": price_sources_config}
 
 
+# ---------------------------------------------------------------------------
+# Proxy URL cache — avoid upstream rate limits (CoinGecko 429 etc.)
+# Cache: fresh (< TTL) → serve directly.  Stale (> TTL) → try upstream,
+# on error fall back to stale data.  No data at all → propagate error.
+# ---------------------------------------------------------------------------
+
+_proxy_url_cache: Dict[str, Any] = {}   # { url: { "data": dict, "ts": float } }
+_PROXY_CACHE_TTL = 60  # seconds — fresh window
+_PROXY_STALE_TTL = 600  # seconds — serve stale on upstream error
+
+
 @router.get("/api/proxy/price")
 async def proxy_price(url: str = Query(...), path: str = Query("price")):
-    """Proxy price API calls to avoid CORS issues."""
+    """Proxy price API calls to avoid CORS issues. 60s cache + stale fallback."""
     allowed_domains = [
         "api.binance.com",
         "api.coingecko.com",
+        "pro-api.coingecko.com",
         "api.kraken.com",
         "api.coinbase.com",
         "api.mexc.com",
     ]
 
     parsed = urlparse(url)
+
+    # CoinGecko Pro: rewrite URL when API key is available
+    if parsed.netloc == "api.coingecko.com" and _api_keys.get("coingecko_api_key"):
+        url = url.replace("api.coingecko.com", "pro-api.coingecko.com")
+        parsed = urlparse(url)
+
     if parsed.netloc not in allowed_domains:
         log.warning(f"Price proxy request to non-whitelisted domain: {parsed.netloc}")
 
-    try:
-        client = _get_httpx_client()
-        response = await asyncio.wait_for(client.get(url), timeout=10.0)
-        response.raise_for_status()
-        data = response.json()
+    now = time.time()
+    cached = _proxy_url_cache.get(url)
 
-        price = extract_json_path(data, path)
+    # Fresh cache → serve directly
+    if cached and (now - cached["ts"]) < _PROXY_CACHE_TTL:
+        data = cached["data"]
+    else:
+        # Try upstream
+        data = None
+        try:
+            client = _get_httpx_client()
+            headers = _get_headers_for_domain(parsed.netloc)
+            response = await asyncio.wait_for(
+                client.get(url, headers=headers), timeout=10.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            _proxy_url_cache[url] = {"data": data, "ts": now}
+        except Exception as e:
+            # Upstream failed — fall back to stale cache if available
+            if cached and (now - cached["ts"]) < _PROXY_STALE_TTL:
+                log.info(f"Upstream error ({e}), serving stale cache for {parsed.netloc}")
+                data = cached["data"]
+            else:
+                # No cache at all — propagate error
+                if isinstance(e, httpx.TimeoutException):
+                    raise HTTPException(504, "Upstream timeout")
+                elif isinstance(e, httpx.HTTPStatusError):
+                    raise HTTPException(502, f"Upstream error: {e.response.status_code}")
+                else:
+                    log.error(f"Price proxy error: {e}")
+                    raise HTTPException(500, f"Proxy error: {str(e)}")
 
-        if price is not None:
-            return {"price": float(price), "source": parsed.netloc}
-        else:
-            return {"error": f"Could not extract price at path: {path}", "data": data}
+    price = extract_json_path(data, path)
 
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Upstream timeout")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"Upstream error: {e.response.status_code}")
-    except Exception as e:
-        log.error(f"Price proxy error: {e}")
-        raise HTTPException(500, f"Proxy error: {str(e)}")
+    if price is not None:
+        return {"price": float(price), "source": parsed.netloc}
+    else:
+        return {"error": f"Could not extract price at path: {path}", "data": data}
