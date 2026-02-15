@@ -35,7 +35,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -82,6 +82,81 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 log = logging.getLogger(__name__)
+
+# =============================================================================
+# WEBSOCKET CONNECTION MANAGER
+# =============================================================================
+
+class WSConnectionManager:
+    """Manage WebSocket connections and subscriptions."""
+
+    def __init__(self):
+        self.connections: Dict[str, Dict] = {}  # ws_id -> {ws, subs}
+
+    async def connect(self, ws: WebSocket) -> str:
+        await ws.accept()
+        ws_id = str(uuid.uuid4())[:8]
+        self.connections[ws_id] = {"ws": ws, "subs": {}}
+        log.info(f"WS connected: {ws_id} ({len(self.connections)} total)")
+        return ws_id
+
+    def disconnect(self, ws_id: str):
+        self.connections.pop(ws_id, None)
+
+    def subscribe(self, ws_id: str, channel: str, data: dict = None):
+        if ws_id in self.connections:
+            self.connections[ws_id]["subs"][channel] = data or {}
+
+    def unsubscribe(self, ws_id: str, channel: str):
+        if ws_id in self.connections:
+            self.connections[ws_id]["subs"].pop(channel, None)
+
+    async def send(self, ws_id: str, msg: dict):
+        conn = self.connections.get(ws_id)
+        if conn:
+            try:
+                await conn["ws"].send_json(msg)
+            except Exception:
+                self.disconnect(ws_id)
+
+    async def broadcast(self, channel: str, msg: dict):
+        """Send to all clients subscribed to a channel."""
+        dead = []
+        for ws_id, conn in list(self.connections.items()):
+            if channel in conn["subs"]:
+                try:
+                    await conn["ws"].send_json(msg)
+                except Exception:
+                    dead.append(ws_id)
+        for ws_id in dead:
+            self.disconnect(ws_id)
+
+    async def broadcast_all(self, msg: dict):
+        """Send to ALL connected clients."""
+        dead = []
+        for ws_id, conn in list(self.connections.items()):
+            try:
+                await conn["ws"].send_json(msg)
+            except Exception:
+                dead.append(ws_id)
+        for ws_id in dead:
+            self.disconnect(ws_id)
+
+    async def broadcast_swap(self, swap_id: str, status: dict):
+        """Send swap update to clients subscribed to this specific swap."""
+        dead = []
+        for ws_id, conn in list(self.connections.items()):
+            sub = conn["subs"].get("swap")
+            if sub and sub.get("swap_id") == swap_id:
+                try:
+                    await conn["ws"].send_json({"type": "swap_update", "data": status})
+                except Exception:
+                    dead.append(ws_id)
+        for ws_id in dead:
+            self.disconnect(ws_id)
+
+ws_manager = WSConnectionManager()
+_ws_event_loop = None  # Set on startup, used by threads for async broadcasts
 
 # =============================================================================
 # CONFIGURATION
@@ -227,7 +302,7 @@ def _save_lp_config():
         log.warning(f"Could not persist LP config: {e}")
 
 
-# Default pairs (only functional pairs — BTC/M1, USDC/M1, BTC/USDC)
+# Default pairs — all possible pairs. LP profile selects which are enabled.
 _DEFAULT_PAIRS = {
     "BTC/M1": {
         "enabled": True,
@@ -235,7 +310,8 @@ _DEFAULT_PAIRS = {
         "spread_bid": 0.5,  # % - user sells BTC
         "spread_ask": 0.5,  # % - user buys BTC
         "min": 0.00001,     # BTC (testnet: very low for testing)
-        "max": 1.0,         # BTC
+        "max": 1.0,         # BTC (static fallback)
+        "max_percent": 100, # % of inventory per swap
     },
     "USDC/M1": {
         "enabled": True,
@@ -243,14 +319,49 @@ _DEFAULT_PAIRS = {
         "spread_bid": 0.5,  # % - user sells USDC
         "spread_ask": 0.5,  # % - user buys USDC
         "min": 1,           # USDC (testnet: low for testing)
-        "max": 100000,      # USDC
+        "max": 100000,      # USDC (static fallback)
+        "max_percent": 100, # % of inventory per swap
     },
     "BTC/USDC": {
         "enabled": True,
         # Derived from BTC/M1 and USDC/M1
         "min": 0.00001,     # BTC (testnet: very low for testing)
         "max": 1.0,
+        "max_percent": 100,
     },
+    "PIVX/M1": {
+        "enabled": False,
+        "rate": 3800.0,     # M1 per PIVX (placeholder)
+        "spread_bid": 1.0,
+        "spread_ask": 1.0,
+        "min": 0.1,
+        "max": 10000,
+        "max_percent": 100,
+    },
+    "DASH/M1": {
+        "enabled": False,
+        "rate": 380.0,      # M1 per DASH (placeholder)
+        "spread_bid": 1.0,
+        "spread_ask": 1.0,
+        "min": 0.01,
+        "max": 1000,
+        "max_percent": 100,
+    },
+    "ZEC/M1": {
+        "enabled": False,
+        "rate": 280.0,      # M1 per ZEC (placeholder)
+        "spread_bid": 1.0,
+        "spread_ask": 1.0,
+        "min": 0.01,
+        "max": 1000,
+        "max_percent": 100,
+    },
+}
+
+# LP pair profiles — which pairs each LP enables
+_LP_PAIR_PROFILES = {
+    "lp_pna_01": ["BTC/M1", "USDC/M1"],
+    "lp_pna_02": ["PIVX/M1", "DASH/M1", "ZEC/M1"],
 }
 
 _DEFAULT_CONFIRMATIONS = {
@@ -285,12 +396,15 @@ LP_CONFIG = {
     "name": (_saved or {}).get("name") or _load_lp_name(),
     "version": "0.1.0",
     "endpoint": None,  # Set dynamically
-    "pairs": (_saved or {}).get("pairs") or dict(_DEFAULT_PAIRS),
+    "pairs": {**_DEFAULT_PAIRS, **((_saved or {}).get("pairs") or {})},
     "confirmations": (_saved or {}).get("confirmations") or dict(_DEFAULT_CONFIRMATIONS),
     "inventory": {
         "btc": 0.0,
         "m1": 0,
         "usdc": 0.0,
+        "pivx": 0.0,
+        "dash": 0.0,
+        "zec": 0.0,
     },
     "stats": {
         "swaps_completed": 0,
@@ -303,6 +417,64 @@ LP_CONFIG = {
 # Ensure BTC/M1 rate is always the fixed rate (not overridable from config file)
 if "BTC/M1" in LP_CONFIG["pairs"]:
     LP_CONFIG["pairs"]["BTC/M1"]["rate"] = BTC_M1_FIXED_RATE
+
+# Apply LP pair profile: enable only the pairs assigned to this LP
+_lp_profile = _LP_PAIR_PROFILES.get(LP_CONFIG["id"])
+if _lp_profile:
+    for pair_key in LP_CONFIG["pairs"]:
+        LP_CONFIG["pairs"][pair_key]["enabled"] = pair_key in _lp_profile
+    log.info(f"LP pair profile applied: {_lp_profile}")
+
+
+# Map pair → from-asset inventory key
+_PAIR_INVENTORY_ASSET = {
+    "BTC/M1": "btc",
+    "BTC/USDC": "btc",
+    "USDC/M1": "usdc",
+    "PIVX/M1": "pivx",
+    "DASH/M1": "dash",
+    "ZEC/M1": "zec",
+}
+
+
+def _get_dynamic_max(pair_key: str, pair_config: dict = None) -> float:
+    """Compute max per swap = inventory * max_percent / 100.
+
+    Falls back to static ``max`` when inventory is 0.
+    """
+    if pair_config is None:
+        pair_config = LP_CONFIG["pairs"].get(pair_key, {})
+    pct = pair_config.get("max_percent", 100)  # default 100% of inventory
+
+    asset_key = _PAIR_INVENTORY_ASSET.get(pair_key)
+    if not asset_key:
+        return pair_config.get("max", float("inf"))
+
+    # Use available inventory (wallet - reservations) when flowswap is ready
+    try:
+        avail = _get_available_inventory()
+    except Exception:
+        avail = LP_CONFIG.get("inventory", {})
+
+    inventory = avail.get(asset_key, 0)
+    if inventory <= 0:
+        # No inventory → fall back to static max
+        return pair_config.get("max", float("inf"))
+
+    return inventory * float(pct) / 100.0
+
+
+def _compute_dynamic_max(pair_key: str, pair_config: dict, avail: dict) -> float:
+    """Like _get_dynamic_max but with pre-computed inventory dict."""
+    pct = pair_config.get("max_percent", 100)  # default 100% of inventory
+    asset_key = _PAIR_INVENTORY_ASSET.get(pair_key)
+    if not asset_key:
+        return pair_config.get("max", float("inf"))
+    inventory = avail.get(asset_key, 0)
+    if inventory <= 0:
+        return pair_config.get("max", float("inf"))
+    return inventory * float(pct) / 100.0
+
 
 # Legacy compatibility
 DEFAULT_LP = {
@@ -615,12 +787,13 @@ async def get_status():
     flowswap_active = len([s for s in flowswap_db.values()
                            if s["state"] not in ("completed", "refunded", "failed", "expired")])
 
-    # Detect test mode (all spreads at 0)
+    # Detect test mode (all enabled spreads at 0)
     all_spreads = [
         pair_config.get("spread_bid", 0) + pair_config.get("spread_ask", 0)
         for pair_config in LP_CONFIG["pairs"].values()
+        if pair_config.get("enabled", True)
     ]
-    test_mode = all(s == 0 for s in all_spreads)
+    test_mode = all(s == 0 for s in all_spreads) if all_spreads else False
 
     # Compute reputation score
     reputation = _compute_lp_reputation()
@@ -867,11 +1040,19 @@ async def get_quote(
         raise HTTPException(400, "Cannot swap same asset")
 
     # Check if this pair is enabled on this LP
+    # Derived pairs (e.g. BTC/USDC) route through M1 — enabled if both legs are
     pair_key_fwd = f"{from_asset}/{to_asset}"
     pair_key_rev = f"{to_asset}/{from_asset}"
     fwd_cfg = LP_CONFIG["pairs"].get(pair_key_fwd, {})
     rev_cfg = LP_CONFIG["pairs"].get(pair_key_rev, {})
-    if not (fwd_cfg.get("enabled", False) or rev_cfg.get("enabled", False)):
+    direct_enabled = fwd_cfg.get("enabled", False) or rev_cfg.get("enabled", False)
+    # Check derived via M1: from/M1 + to/M1 both enabled
+    leg_a = LP_CONFIG["pairs"].get(f"{from_asset}/M1", {}).get("enabled", False) or \
+            LP_CONFIG["pairs"].get(f"M1/{from_asset}", {}).get("enabled", False)
+    leg_b = LP_CONFIG["pairs"].get(f"{to_asset}/M1", {}).get("enabled", False) or \
+            LP_CONFIG["pairs"].get(f"M1/{to_asset}", {}).get("enabled", False)
+    derived_enabled = (from_asset != "M1" and to_asset != "M1" and leg_a and leg_b)
+    if not (direct_enabled or derived_enabled):
         raise HTTPException(400, f"Pair {from_asset}/{to_asset} not enabled on this LP")
 
     # Fetch live price (updates LP_CONFIG automatically)
@@ -902,7 +1083,7 @@ async def get_quote(
         spread_percent = LP_CONFIG["pairs"]["BTC/M1"]["spread_bid"]
         effective_rate = market_rate * (1 - spread_percent / 100)
         min_amount = LP_CONFIG["pairs"]["BTC/M1"]["min"]
-        max_amount = LP_CONFIG["pairs"]["BTC/M1"]["max"]
+        max_amount = _get_dynamic_max("BTC/M1")
 
     elif from_asset == "M1" and to_asset == "BTC":
         # M1 → BTC: User buys BTC (ask)
@@ -910,7 +1091,7 @@ async def get_quote(
         spread_percent = LP_CONFIG["pairs"]["BTC/M1"]["spread_ask"]
         effective_rate = market_rate * (1 - spread_percent / 100)
         min_amount = LP_CONFIG["pairs"]["BTC/M1"]["min"] * BTC_M1_FIXED_RATE
-        max_amount = LP_CONFIG["pairs"]["BTC/M1"]["max"] * BTC_M1_FIXED_RATE
+        max_amount = _get_dynamic_max("BTC/M1") * BTC_M1_FIXED_RATE
 
     elif from_asset == "USDC" and to_asset == "M1":
         # USDC → M1: User sells USDC (bid)
@@ -918,7 +1099,7 @@ async def get_quote(
         spread_percent = LP_CONFIG["pairs"]["USDC/M1"]["spread_bid"]
         effective_rate = market_rate * (1 - spread_percent / 100)
         min_amount = LP_CONFIG["pairs"]["USDC/M1"]["min"]
-        max_amount = LP_CONFIG["pairs"]["USDC/M1"]["max"]
+        max_amount = _get_dynamic_max("USDC/M1")
 
     elif from_asset == "M1" and to_asset == "USDC":
         # M1 → USDC: User buys USDC (ask)
@@ -926,7 +1107,7 @@ async def get_quote(
         spread_percent = LP_CONFIG["pairs"]["USDC/M1"]["spread_ask"]
         effective_rate = market_rate * (1 - spread_percent / 100)
         min_amount = LP_CONFIG["pairs"]["USDC/M1"]["min"] * LP_CONFIG["pairs"]["USDC/M1"]["rate"]
-        max_amount = LP_CONFIG["pairs"]["USDC/M1"]["max"] * LP_CONFIG["pairs"]["USDC/M1"]["rate"]
+        max_amount = _get_dynamic_max("USDC/M1") * LP_CONFIG["pairs"]["USDC/M1"]["rate"]
 
     elif from_asset == "BTC" and to_asset == "USDC":
         # BTC → USDC: Goes through M1 (BTC→M1→USDC)
@@ -938,7 +1119,7 @@ async def get_quote(
                          LP_CONFIG["pairs"]["USDC/M1"]["spread_ask"])
         effective_rate = market_rate * (1 - spread_percent / 100)
         min_amount = LP_CONFIG["pairs"]["BTC/USDC"]["min"]
-        max_amount = LP_CONFIG["pairs"]["BTC/USDC"]["max"]
+        max_amount = _get_dynamic_max("BTC/USDC")
 
     elif from_asset == "USDC" and to_asset == "BTC":
         # USDC → BTC: Goes through M1 (USDC→M1→BTC)
@@ -950,7 +1131,7 @@ async def get_quote(
                          LP_CONFIG["pairs"]["BTC/M1"]["spread_ask"])
         effective_rate = market_rate * (1 - spread_percent / 100)
         min_amount = LP_CONFIG["pairs"]["BTC/USDC"]["min"] * (btc_m1_rate / usdc_m1_rate)
-        max_amount = LP_CONFIG["pairs"]["BTC/USDC"]["max"] * (btc_m1_rate / usdc_m1_rate)
+        max_amount = _get_dynamic_max("BTC/USDC") * (btc_m1_rate / usdc_m1_rate)
     else:
         raise HTTPException(400, f"Unsupported pair: {from_asset}/{to_asset}")
 
@@ -1478,6 +1659,12 @@ async def get_lp_info():
     uptime_seconds = int(time.time()) - LP_CONFIG["stats"]["uptime_start"]
     uptime_hours = uptime_seconds / 3600
 
+    # Pre-compute available inventory once (avoid repeated calls in loop)
+    try:
+        _avail_info = _get_available_inventory()
+    except Exception:
+        _avail_info = LP_CONFIG.get("inventory", {})
+
     # Get current rates for each pair
     pairs_info = {}
     for pair_key, pair_config in LP_CONFIG["pairs"].items():
@@ -1522,22 +1709,25 @@ async def get_lp_info():
             "spread_bid": pair_config.get("spread_bid", 0),
             "spread_ask": pair_config.get("spread_ask", 0),
             "min": pair_config.get("min", 0),
-            "max": pair_config.get("max", float('inf')),
+            "max": _compute_dynamic_max(pair_key, pair_config, _avail_info),
+            "max_percent": pair_config.get("max_percent", 100),
+            "available": _avail_info.get(
+                _PAIR_INVENTORY_ASSET.get(pair_key, ""), 0),
         }
 
-    # Detect test mode (all spreads at 0)
+    # Detect test mode (all enabled spreads at 0)
     all_spreads = [
         pair_config.get("spread_bid", 0) + pair_config.get("spread_ask", 0)
         for pair_config in LP_CONFIG["pairs"].values()
+        if pair_config.get("enabled", True)
     ]
-    test_mode = all(s == 0 for s in all_spreads)
+    test_mode = all(s == 0 for s in all_spreads) if all_spreads else False
 
     with _flowswap_lock:
         _avail = _get_available_inventory()
     _status_inventory_snapshot = {
-        "btc_available": _avail.get("btc", 0) > 0,
-        "m1_available": _avail.get("m1", 0) > 0,
-        "usdc_available": _avail.get("usdc", 0) > 0,
+        f"{asset}_available": _avail.get(asset, 0) > 0
+        for asset in ("btc", "m1", "usdc", "pivx", "dash", "zec")
     }
 
     return {
@@ -1586,7 +1776,7 @@ async def update_lp_config(config: LPConfigUpdate):
         for pair_key, pair_data in config.pairs.items():
             if pair_key in LP_CONFIG["pairs"]:
                 # Update only provided fields
-                for field in ["enabled", "spread_bid", "spread_ask", "min", "max", "rate"]:
+                for field in ["enabled", "spread_bid", "spread_ask", "min", "max", "max_percent", "rate"]:
                     if field in pair_data:
                         LP_CONFIG["pairs"][pair_key][field] = pair_data[field]
                 log.info(f"Pair config updated: {pair_key}")
@@ -1775,23 +1965,33 @@ async def refresh_inventory():
             log.warning(f"Error getting ZEC balance: {e}")
     LP_CONFIG["inventory"]["zec"] = zec_balance
 
-    # For M1, use SDK receipts (actual M1 liquidity available for swaps)
-    m1_balance = 0
+    # For M1: effective liquidity = M1 receipts + M0 available
+    # (M0 → M1 lock is free and instant, so M0 is convertible M1)
+    # BATHRON: ValueFromAmount returns raw sats (1 M0 = 1 sat)
+    m1_receipts_sats = 0
+    m0_available_sats = 0
     if SDK_AVAILABLE:
         try:
             m1_client = get_m1_client()
             if m1_client:
                 receipts = m1_client.list_m1_receipts()
-                # Receipt amounts from getwalletstate are already in coins
-                # (ValueFromAmount in C++ divides sats by COIN=100,000,000)
-                m1_balance = sum(r.get("amount", 0) for r in receipts if r.get("unlockable", False))
+                # Amounts are in sats (BATHRON: ValueFromAmount = raw integer)
+                m1_receipts_sats = sum(
+                    int(r.get("amount", 0))
+                    for r in receipts if r.get("unlockable", False)
+                )
+                # Also get M0 balance (convertible to M1 via lock)
+                try:
+                    ws = m1_client.get_wallet_state()
+                    if ws:
+                        m0_available_sats = int(ws.get("m0", {}).get("balance", 0))
+                except Exception:
+                    pass
         except Exception as e:
-            log.error(f"Error getting M1 receipts: {e}")
-            # Fall back to wallet M0 balance
-            m1_balance = wallets.get("m1", {}).get("balance", 0)
-    else:
-        m1_balance = wallets.get("m1", {}).get("balance", 0)
+            log.error(f"Error getting M1/M0 balance: {e}")
 
+    # Effective M1 = M1 receipts + M0 (all in sats)
+    m1_balance = m1_receipts_sats + m0_available_sats
     LP_CONFIG["inventory"]["m1"] = m1_balance
 
     log.info(f"Inventory refreshed: BTC={LP_CONFIG['inventory']['btc']}, "
@@ -1804,6 +2004,9 @@ async def refresh_inventory():
             k: round(LP_CONFIG["inventory"].get(k, 0) - available.get(k, 0), 8)
             for k in ("btc", "m1", "usdc")
         }
+
+    # Broadcast inventory update via WS
+    ws_notify_inventory()
 
     return {
         "success": True,
@@ -2724,12 +2927,26 @@ def _get_available_inventory() -> Dict[str, float]:
 
 
 def _rebuild_reservations_from_db():
-    """Rebuild inventory reservations from active swaps on startup. Must hold _flowswap_lock."""
+    """Rebuild inventory reservations from active swaps on startup. Must hold _flowswap_lock.
+
+    Only reserve for swaps where LP hasn't locked on-chain yet (AWAITING_*, BTC_FUNDED,
+    USDC_FUNDED).  Once LP has locked (LP_LOCKED+), the USDC/M1 is already out of the
+    wallet — reserving it again would double-count against the reduced balance.
+    """
     _inventory_reservations.clear()
+    # States where LP has NOT yet committed on-chain
+    PRE_LOCK_STATES = {
+        FlowSwapState.AWAITING_BTC.value,
+        FlowSwapState.AWAITING_USDC.value,
+        FlowSwapState.BTC_FUNDED.value,
+        FlowSwapState.USDC_FUNDED.value,
+    }
     for swap_id, fs in flowswap_db.items():
         state = fs.get("state", "")
         if state in TERMINAL_STATES:
             continue
+        if state not in PRE_LOCK_STATES:
+            continue  # LP already locked on-chain — wallet balance already reflects it
         direction = fs.get("direction", "forward")
         m1_sats = fs.get("m1_amount_sats", 0) or 0
         if direction == "reverse":
@@ -2765,7 +2982,17 @@ def _process_expired_htlcs():
     lp_fallback_address = lp_btc_key.get("address", "")
 
     if not refund_wif:
-        log.info("Auto-refund: no claim_wif in btc.json, will use wallet signing")
+        # Dump WIF from Bitcoin Core wallet (signrawtransactionwithwallet
+        # can't handle custom P2WSH HTLC scripts — need manual witness)
+        lp_address = lp_btc_key.get("address", "")
+        if lp_address:
+            try:
+                refund_wif = btc_3s.client._call("dumpprivkey", lp_address)
+                log.info(f"Auto-refund: dumped WIF for {lp_address[:12]}...")
+            except Exception as e:
+                log.warning(f"Auto-refund: cannot dump privkey: {e}")
+        if not refund_wif:
+            log.warning("Auto-refund: no WIF available, refunds will fail")
 
     refunded_any = False
     candidates = 0
@@ -2799,19 +3026,39 @@ def _process_expired_htlcs():
                 continue
 
             # Check UTXO still exists (not claimed already)
+            # Use gettxout first (fast) before scantxoutset (slow)
             htlc_address = fs.get("btc_htlc_address", "")
             amount_sats = fs.get("btc_amount_sats", 0)
             if not htlc_address or not amount_sats:
                 continue
 
-            try:
-                utxo = btc_3s.check_htlc_funded(
-                    htlc_address=htlc_address,
-                    expected_amount=amount_sats,
-                    min_confirmations=0,
-                )
-            except Exception:
-                continue
+            utxo = None
+            fund_txid = fs.get("btc_fund_txid")
+            if fund_txid:
+                # Fast path: gettxout by known txid
+                for vout_idx in range(4):
+                    try:
+                        txout = btc_3s.client._call("gettxout", fund_txid, vout_idx, True)
+                        if txout and txout.get("value", 0) > 0:
+                            spk = txout.get("scriptPubKey", {})
+                            addr = spk.get("address", "") or (spk.get("addresses", [None])[0] or "")
+                            if addr == htlc_address:
+                                utxo = {"txid": fund_txid, "vout": vout_idx,
+                                        "amount": amount_sats,
+                                        "confirmations": txout.get("confirmations", 0)}
+                                break
+                    except Exception:
+                        pass
+            if not utxo:
+                # Slow fallback: scantxoutset
+                try:
+                    utxo = btc_3s.check_htlc_funded(
+                        htlc_address=htlc_address,
+                        expected_amount=amount_sats,
+                        min_confirmations=0,
+                    )
+                except Exception:
+                    continue
 
             if not utxo:
                 continue  # Already spent (claimed or previously refunded)
@@ -3194,6 +3441,27 @@ def _startup_recover_all_swaps():
         state = fs.get("state", "")
         direction = fs.get("direction", "forward")
 
+        # Recover failed swaps that have a fund_txid — may have failed
+        # due to transient issues (e.g. scantxoutset stale, insufficient liquidity).
+        # Skip permanent failures (insufficient liquidity, missing keys).
+        if state == FlowSwapState.FAILED.value and fs.get("btc_fund_txid"):
+            error_msg = fs.get("error", "") or ""
+            if "Insufficient" in error_msg:
+                log.info(f"Recovery: skipping {swap_id} — permanent failure: {error_msg[:60]}")
+                continue
+            if not fs.get("btc_claim_txid") and not fs.get("btc_refund_txid"):
+                log.info(f"Recovery: retrying failed swap {swap_id} (has btc_fund_txid)")
+                fs["state"] = FlowSwapState.BTC_FUNDED.value
+                fs["error"] = None
+                fs["updated_at"] = int(time.time())
+                threading.Thread(
+                    target=_do_lp_lock_forward,
+                    args=(swap_id,),
+                    daemon=True,
+                ).start()
+                recovered_lock += 1
+                continue
+
         if state in TERMINAL_STATES:
             continue
 
@@ -3445,6 +3713,14 @@ async def _flowswap_init_btc_to_usdc(req: FlowSwapInitRequest, client_ip: str = 
     # Anti-grief: minimum amount
     if btc_amount_sats < MIN_SWAP_BTC_SATS:
         raise HTTPException(400, f"Amount too small: {btc_amount_sats} sats (min {MIN_SWAP_BTC_SATS})")
+
+    # Inventory gate: reject if LP can't fill the order
+    with _flowswap_lock:
+        available = _get_available_inventory()
+    avail_usdc = available.get("usdc", 0)
+    if avail_usdc < usdc_amount:
+        raise HTTPException(503,
+            f"Insufficient USDC liquidity: {avail_usdc:.2f} available, {usdc_amount:.2f} needed")
 
     swap_id = f"fs_{uuid.uuid4().hex[:16]}"
     now = int(time.time())
@@ -3984,6 +4260,53 @@ async def flowswap_init_leg(req: LegInitRequest, request: Request = None):
         }
 
 
+def _verify_btc_tx_exists(btc_3s, fs: dict, btc_txid: str) -> bool:
+    """Check if BTC TX exists — fast methods first, scantxoutset last resort.
+
+    Order: gettxout (instant) → getrawtransaction (fast) → scantxoutset (slow).
+    scantxoutset can take 30+ seconds and blocks other scans.
+    """
+    # Fast path 1: gettxout (direct UTXO set lookup, no scan needed)
+    for vout_idx in range(4):
+        try:
+            txout = btc_3s.client._call("gettxout", btc_txid, vout_idx, True)
+            if txout and txout.get("value", 0) > 0:
+                spk = txout.get("scriptPubKey", {})
+                addr = spk.get("address", "")
+                if not addr:
+                    addrs = spk.get("addresses", [])
+                    addr = addrs[0] if addrs else ""
+                if addr == fs.get("btc_htlc_address"):
+                    confs = txout.get("confirmations", 0)
+                    if confs > 0:
+                        fs["btc_fund_confs"] = confs
+                    return True
+        except Exception:
+            pass
+    # Fast path 2: getrawtransaction (works with txindex or for mempool/wallet TXs)
+    try:
+        raw = btc_3s.client._call("getrawtransaction", btc_txid, True)
+        if raw and raw.get("confirmations", 0) >= 0:
+            confs = raw.get("confirmations", 0)
+            if confs > 0:
+                fs["btc_fund_confs"] = confs
+            return True
+    except Exception:
+        pass
+    # Last resort: scantxoutset (slow, but handles edge cases)
+    try:
+        utxo = btc_3s.check_htlc_funded(
+            htlc_address=fs["btc_htlc_address"],
+            expected_amount=fs["btc_amount_sats"],
+            min_confirmations=0,
+        )
+        if utxo:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _do_lp_lock_forward(swap_id: str):
     """
     Background: LP locks M1 (BATHRON) + USDC (EVM) after user's BTC is confirmed.
@@ -4009,32 +4332,13 @@ def _do_lp_lock_forward(swap_id: str):
         confs_at_accept = fs.get("btc_fund_confs", 0)
 
         # --- 0-conf stability check (CLS model: speed with safety) ---
+        # NOTE: RBF check removed. BTC_CLAIM_MIN_CONFIRMATIONS=1 gate already
+        # protects against RBF double-spend: LP locks M1+USDC at 0-conf but
+        # won't reveal secrets (BTC claim) until funding TX has 1 confirmation.
+        # Worst case: user RBFs → LP locked M1+USDC for nothing → all HTLCs
+        # timeout and auto-refund → LP wastes gas, no fund loss.
         if btc_3s and btc_txid and confs_at_accept == 0:
-            # Step A: RBF + feerate check (reject RBF-signaled and dust-fee TXs)
-            min_feerate = _get_instant_min_feerate()
-            try:
-                safety = btc_3s.verify_tx_safe_for_0conf(
-                    txid=btc_txid,
-                    htlc_address=fs["btc_htlc_address"],
-                    expected_amount_sats=fs["btc_amount_sats"],
-                    min_fee_rate=min_feerate,
-                )
-                fs["btc_0conf_safety"] = safety
-                fee_rate = safety.get("details", {}).get("fee_rate")
-                if fee_rate is not None:
-                    fs["btc_feerate"] = round(fee_rate, 2)
-                if not safety.get("safe"):
-                    raise Exception(
-                        f"BTC TX failed 0-conf safety: {safety.get('reason')}. "
-                        f"Bump fee or wait for confirmation."
-                    )
-                log.info(f"FlowSwap {swap_id}: 0-conf safety OK: {safety.get('reason')}")
-            except Exception as e:
-                if "safety" in str(e).lower() or "rbf" in str(e).lower() or "fee" in str(e).lower():
-                    raise
-                log.warning(f"FlowSwap {swap_id}: could not run 0-conf safety check: {e}")
-
-            # Step B: Stability wait — TX must survive 30s in mempool
+            # Stability wait — TX must survive 30s in mempool
             stability_secs = 30
             log.info(f"FlowSwap {swap_id}: 0-conf stability check ({stability_secs}s)...")
             with _flowswap_lock:
@@ -4044,11 +4348,7 @@ def _do_lp_lock_forward(swap_id: str):
             time.sleep(stability_secs)
 
             # Step C: Re-check TX still exists after wait
-            still_exists = btc_3s.check_htlc_funded(
-                htlc_address=fs["btc_htlc_address"],
-                expected_amount=fs["btc_amount_sats"],
-                min_confirmations=0,
-            )
+            still_exists = _verify_btc_tx_exists(btc_3s, fs, btc_txid)
             if not still_exists:
                 raise Exception("BTC TX replaced/dropped during stability check (RBF grief)")
             log.info(f"FlowSwap {swap_id}: 0-conf stable after {stability_secs}s — proceeding")
@@ -4058,11 +4358,7 @@ def _do_lp_lock_forward(swap_id: str):
 
         # --- Confirmed TX: verify still exists ---
         elif btc_3s and btc_txid:
-            still_exists = btc_3s.check_htlc_funded(
-                htlc_address=fs["btc_htlc_address"],
-                expected_amount=fs["btc_amount_sats"],
-                min_confirmations=0,
-            )
+            still_exists = _verify_btc_tx_exists(btc_3s, fs, btc_txid)
             if not still_exists:
                 raise Exception("BTC TX disappeared from mempool (possible RBF replacement)")
 
@@ -4110,49 +4406,54 @@ def _do_lp_lock_forward(swap_id: str):
                     raise Exception(f"BTC claim pre-signing failed: {e}. Aborting before M1 lock.")
 
         # Step 1: Lock M1 on BATHRON (cheap — only M1 gas ~23 sats at risk on failure)
-        m1_3s = get_m1_htlc_3s()
-        if not m1_3s:
-            raise Exception("M1 HTLC3S client not available")
-        covenant_c3 = None
-        covenant_dest = None
-        if is_perleg and fs.get("lp_out_m1_address"):
-            m1_claim_address = fs["lp_out_m1_address"]
-            log.info(f"FlowSwap {swap_id}: Per-leg mode — M1 claim_address → LP_OUT: {m1_claim_address[:16]}...")
-            # Compute C3 covenant template hash (forces claim TX output → LP_OUT)
-            try:
-                c3_result = m1_3s.client.htlc3s_compute_c3(
-                    fs["m1_amount_sats"], m1_claim_address
-                )
-                covenant_c3 = c3_result.get("template_hash")
-                covenant_dest = m1_claim_address
-                log.info(f"FlowSwap {swap_id}: Covenant C3={covenant_c3[:16]}... → {covenant_dest[:16]}...")
-            except Exception as e:
-                raise Exception(f"C3 covenant computation failed — cannot create per-leg HTLC without covenant: {e}")
+        # Idempotency: skip if M1 HTLC already exists from a previous attempt
+        if fs.get("m1_htlc_outpoint"):
+            log.info(f"FlowSwap {swap_id}: M1 HTLC already exists ({fs['m1_htlc_outpoint']}), "
+                     f"skipping M1 lock step")
         else:
-            m1_claim_address = _lp_addresses.get("m1", "")
-        if not m1_claim_address:
-            raise Exception("M1 claim address not configured — cannot create HTLC")
+            m1_3s = get_m1_htlc_3s()
+            if not m1_3s:
+                raise Exception("M1 HTLC3S client not available")
+            covenant_c3 = None
+            covenant_dest = None
+            if is_perleg and fs.get("lp_out_m1_address"):
+                m1_claim_address = fs["lp_out_m1_address"]
+                log.info(f"FlowSwap {swap_id}: Per-leg mode — M1 claim_address → LP_OUT: {m1_claim_address[:16]}...")
+                # Compute C3 covenant template hash (forces claim TX output → LP_OUT)
+                try:
+                    c3_result = m1_3s.client.htlc3s_compute_c3(
+                        fs["m1_amount_sats"], m1_claim_address
+                    )
+                    covenant_c3 = c3_result.get("template_hash")
+                    covenant_dest = m1_claim_address
+                    log.info(f"FlowSwap {swap_id}: Covenant C3={covenant_c3[:16]}... → {covenant_dest[:16]}...")
+                except Exception as e:
+                    raise Exception(f"C3 covenant computation failed — cannot create per-leg HTLC without covenant: {e}")
+            else:
+                m1_claim_address = _lp_addresses.get("m1", "")
+            if not m1_claim_address:
+                raise Exception("M1 claim address not configured — cannot create HTLC")
 
-        receipt_outpoint = m1_3s.ensure_receipt_available(fs["m1_amount_sats"])
-        m1_result = m1_3s.create_htlc(
-            receipt_outpoint=receipt_outpoint,
-            H_user=fs["H_user"],
-            H_lp1=fs["H_lp1"],
-            H_lp2=fs["H_lp2"],
-            claim_address=m1_claim_address,
-            expiry_blocks=FLOWSWAP_TIMELOCK_M1_BLOCKS,
-            template_commitment=covenant_c3,
-            covenant_dest_address=covenant_dest,
-        )
+            receipt_outpoint = m1_3s.ensure_receipt_available(fs["m1_amount_sats"])
+            m1_result = m1_3s.create_htlc(
+                receipt_outpoint=receipt_outpoint,
+                H_user=fs["H_user"],
+                H_lp1=fs["H_lp1"],
+                H_lp2=fs["H_lp2"],
+                claim_address=m1_claim_address,
+                expiry_blocks=FLOWSWAP_TIMELOCK_M1_BLOCKS,
+                template_commitment=covenant_c3,
+                covenant_dest_address=covenant_dest,
+            )
 
-        with _flowswap_lock:
-            fs["m1_htlc_outpoint"] = m1_result.get("htlc_outpoint")
-            fs["m1_htlc_txid"] = m1_result.get("txid")
-            fs["m1_has_covenant"] = m1_result.get("has_covenant", False)
-            if covenant_c3:
-                fs["m1_covenant_c3"] = covenant_c3
-        log.info(f"FlowSwap {swap_id}: M1 locked, outpoint={m1_result.get('htlc_outpoint')}, "
-                 f"covenant={m1_result.get('has_covenant', False)}")
+            with _flowswap_lock:
+                fs["m1_htlc_outpoint"] = m1_result.get("htlc_outpoint")
+                fs["m1_htlc_txid"] = m1_result.get("txid")
+                fs["m1_has_covenant"] = m1_result.get("has_covenant", False)
+                if covenant_c3:
+                    fs["m1_covenant_c3"] = covenant_c3
+            log.info(f"FlowSwap {swap_id}: M1 locked, outpoint={m1_result.get('htlc_outpoint')}, "
+                     f"covenant={m1_result.get('has_covenant', False)}")
 
         # Per-leg: LP_IN only locks M1, not USDC (LP_OUT handles USDC)
         if is_perleg:
@@ -4161,20 +4462,18 @@ def _do_lp_lock_forward(swap_id: str):
                 fs["updated_at"] = int(time.time())
                 fs.pop("_lp_locking", None)
                 _save_flowswap_db()
+            ws_notify_swap(swap_id)
             log.info(f"FlowSwap {swap_id}: M1_LOCKED (per-leg, waiting for LP_OUT to lock USDC)")
             return  # LP_OUT will lock USDC via /m1-locked endpoint
 
         # Re-check BTC TX before committing USDC (most expensive leg)
         if btc_3s and fs.get("btc_fund_txid"):
-            still_exists = btc_3s.check_htlc_funded(
-                htlc_address=fs["btc_htlc_address"],
-                expected_amount=fs["btc_amount_sats"],
-                min_confirmations=0,
-            )
+            still_exists = _verify_btc_tx_exists(btc_3s, fs, fs["btc_fund_txid"])
             if not still_exists:
                 raise Exception("BTC TX replaced (RBF) after M1 lock — aborting USDC lock")
 
         # Step 2: Lock USDC on EVM (expensive — real USDC at risk)
+        # Pre-check: verify LP has enough USDC before calling the contract
         evm_htlc = get_evm_htlc_3s()
         if not evm_htlc:
             raise Exception("EVM HTLC3S client not available")
@@ -4182,6 +4481,20 @@ def _do_lp_lock_forward(swap_id: str):
         evm_privkey = _load_evm_private_key()
         if not evm_privkey:
             raise Exception("EVM private key not configured")
+
+        try:
+            from sdk.htlc.evm import get_usdc_balance as _get_usdc_bal
+            lp_evm_addr = _lp_addresses.get("usdc", "") or fs.get("lp_usdc_address", "")
+            if lp_evm_addr:
+                usdc_balance = _get_usdc_bal(lp_evm_addr)
+                if usdc_balance < fs["usdc_amount"]:
+                    raise Exception(
+                        f"Insufficient USDC: wallet has {usdc_balance:.2f}, "
+                        f"need {fs['usdc_amount']:.2f}")
+        except Exception as e:
+            if "Insufficient" in str(e):
+                raise
+            log.warning(f"FlowSwap {swap_id}: USDC balance pre-check failed: {e}")
 
         evm_result = evm_htlc.create_htlc(
             recipient=fs["user_usdc_address"],
@@ -4204,7 +4517,11 @@ def _do_lp_lock_forward(swap_id: str):
             fs["lp_locked_at"] = int(time.time())
             fs["updated_at"] = int(time.time())
             fs.pop("_lp_locking", None)
+            # Release reservation: USDC + M1 are now on-chain (out of wallet).
+            # Wallet balance already reflects the reduction.
+            _release_reservation(swap_id)
             _save_flowswap_db()
+        ws_notify_swap(swap_id)
         log.info(f"FlowSwap {swap_id}: LP_LOCKED (M1 + USDC confirmed on-chain)")
 
     except Exception as e:
@@ -4216,6 +4533,26 @@ def _do_lp_lock_forward(swap_id: str):
             fs.pop("_lp_locking", None)
             _release_reservation(swap_id)
             _save_flowswap_db()
+        ws_notify_swap(swap_id)
+
+        # M1 rollback: if M1 was locked but USDC failed, start M1 refund in background
+        if fs.get("m1_htlc_outpoint") and not fs.get("evm_htlc_id"):
+            def _rollback_m1():
+                try:
+                    m1_3s_rb = get_m1_htlc_3s()
+                    if m1_3s_rb:
+                        log.info(f"FlowSwap {swap_id}: M1 rollback — refunding locked M1 (USDC lock failed)")
+                        rb_result = m1_3s_rb.refund(htlc_outpoint=fs["m1_htlc_outpoint"])
+                        with _flowswap_lock:
+                            fs["m1_refund_txid"] = rb_result.get("txid")
+                            fs["updated_at"] = int(time.time())
+                            _save_flowswap_db()
+                        log.info(f"FlowSwap {swap_id}: M1 refunded, txid={rb_result.get('txid')}")
+                    else:
+                        log.error(f"FlowSwap {swap_id}: M1 rollback — M1 client unavailable, will refund via timelock")
+                except Exception as rb_err:
+                    log.error(f"FlowSwap {swap_id}: M1 rollback error: {rb_err} — will refund via timelock")
+            threading.Thread(target=_rollback_m1, daemon=True).start()
 
 
 def _do_lp_lock_reverse(swap_id: str):
@@ -4305,6 +4642,7 @@ def _do_lp_lock_reverse(swap_id: str):
             fs["updated_at"] = int(time.time())
             fs.pop("_lp_locking", None)
             _save_flowswap_db()
+        ws_notify_swap(swap_id)
         log.info(f"FlowSwap {swap_id}: LP_LOCKED (M1 + BTC confirmed on-chain)")
 
     except Exception as e:
@@ -4316,6 +4654,7 @@ def _do_lp_lock_reverse(swap_id: str):
             fs.pop("_lp_locking", None)
             _release_reservation(swap_id)
             _save_flowswap_db()
+        ws_notify_swap(swap_id)
 
 
 class USDCFundedRequest(BaseModel):
@@ -4552,6 +4891,7 @@ async def flowswap_status(swap_id: str):
             "htlc_id": fs.get("evm_htlc_id", ""),
             "lock_txhash": fs.get("evm_lock_txhash"),
             "claim_txhash": fs.get("evm_claim_txhash"),
+            "contract_address": HTLC3S_CONTRACT_ADDRESS,
         },
         "user_usdc_address": fs.get("user_usdc_address", ""),
         "created_at": fs.get("created_at", 0),
@@ -4637,6 +4977,7 @@ async def flowswap_btc_funded(swap_id: str):
         _reserve_inventory(swap_id, m1_sats=fs.get("m1_amount_sats", 0),
                            usdc=fs.get("usdc_amount", 0))
         _save_flowswap_db()
+    ws_notify_swap(swap_id)
 
     log.info(f"FlowSwap {swap_id}: BTC funded, txid={utxo['txid']}, "
              f"confs={utxo['confirmations']}, required={required_confs}")
@@ -4858,6 +5199,17 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
             raise HTTPException(400, f"LP has not locked yet (state: {fs['state']}). Wait for state=lp_locked.")
         raise HTTPException(400, f"Invalid state for presign: {fs['state']} (expected lp_locked)")
 
+    # Idempotency guard: BTC already claimed
+    if fs.get("btc_claim_txid"):
+        raise HTTPException(400, f"BTC already claimed (txid={fs['btc_claim_txid'][:16]}...)")
+
+    # Verify on-chain locks exist before accepting S_user (forward flow)
+    if fs.get("direction") != "reverse":
+        if not fs.get("evm_htlc_id") and not fs.get("is_perleg"):
+            raise HTTPException(400, "USDC not locked on EVM — cannot accept presign")
+        if not fs.get("m1_htlc_outpoint") and not fs.get("is_perleg"):
+            raise HTTPException(400, "M1 not locked on BATHRON — cannot accept presign")
+
     # Verify SHA256(S_user) == H_user
     computed_hash = hashlib.sha256(bytes.fromhex(req.S_user)).hexdigest()
     if computed_hash != fs["H_user"]:
@@ -4926,10 +5278,12 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
         log.error(f"FlowSwap {swap_id}: BTC claim failed: {e}")
         raise HTTPException(500, f"BTC claim failed: {e}")
 
-    fs["btc_claim_txid"] = btc_claim_txid
-    fs["state"] = FlowSwapState.BTC_CLAIMED.value
-    fs["updated_at"] = int(time.time())
-    _save_flowswap_db()
+    with _flowswap_lock:
+        fs["btc_claim_txid"] = btc_claim_txid
+        fs["S_user"] = req.S_user
+        fs["state"] = FlowSwapState.BTC_CLAIMED.value
+        fs["updated_at"] = int(time.time())
+        _save_flowswap_db()
 
     log.info(f"FlowSwap {swap_id}: BTC claimed, txid={btc_claim_txid}")
 
@@ -5042,15 +5396,20 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
                 return
 
             # ── Claim USDC on EVM (only AFTER BTC claim is confirmed) ──
-            if not fs.get("evm_claim_txhash"):
+            S_user_local = fs.get("S_user", "")
+            S_lp1_local = fs.get("S_lp1", "")
+            S_lp2_local = fs.get("S_lp2", "")
+            evm_claimed = bool(fs.get("evm_claim_txhash"))
+
+            if not evm_claimed and fs.get("evm_htlc_id"):
                 evm = get_evm_htlc_3s()
                 evm_privkey = _load_evm_private_key()
                 if evm and evm_privkey:
                     evm_result = evm.claim_htlc(
                         htlc_id=fs["evm_htlc_id"],
-                        S_user=req.S_user,
-                        S_lp1=fs["S_lp1"],
-                        S_lp2=fs["S_lp2"],
+                        S_user=S_user_local,
+                        S_lp1=S_lp1_local,
+                        S_lp2=S_lp2_local,
                         private_key=evm_privkey,
                     )
                     if evm_result.success:
@@ -5059,24 +5418,29 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
                             fs["updated_at"] = int(time.time())
                             _save_flowswap_db()
                         log.info(f"FlowSwap {swap_id}: USDC claimed, tx={evm_result.tx_hash}")
+                        evm_claimed = True
                     else:
                         log.error(f"FlowSwap {swap_id}: USDC claim failed: {evm_result.error}")
-            else:
+                else:
+                    log.error(f"FlowSwap {swap_id}: EVM client or privkey unavailable for USDC claim")
+            elif evm_claimed:
                 log.info(f"FlowSwap {swap_id}: USDC already claimed, skipping")
+            elif not fs.get("evm_htlc_id"):
+                log.error(f"FlowSwap {swap_id}: No evm_htlc_id — USDC was never locked, skipping EVM claim")
 
             # Claim M1 on BATHRON — retry until HTLC is in a block
-            m1_claimed = True  # default: True for "already claimed" / "no m1_3s" paths
-            if not fs.get("m1_claim_txid"):
+            m1_claimed = bool(fs.get("m1_claim_txid"))
+
+            if not m1_claimed and fs.get("m1_htlc_outpoint"):
                 m1_3s = get_m1_htlc_3s()
                 if m1_3s:
-                    m1_claimed = False
                     for attempt in range(12):  # up to 2 minutes
                         try:
                             m1_result = m1_3s.claim(
                                 htlc_outpoint=fs["m1_htlc_outpoint"],
-                                S_user=req.S_user,
-                                S_lp1=fs["S_lp1"],
-                                S_lp2=fs["S_lp2"],
+                                S_user=S_user_local,
+                                S_lp1=S_lp1_local,
+                                S_lp2=S_lp2_local,
                             )
                             with _flowswap_lock:
                                 fs["m1_claim_txid"] = m1_result.get("txid")
@@ -5094,22 +5458,30 @@ async def flowswap_presign(swap_id: str, req: FlowSwapPresignRequest):
                     if not m1_claimed:
                         log.error(f"FlowSwap {swap_id}: M1 claim failed after 12 retries — background scheduler will refund via timelock")
                 else:
-                    m1_claimed = False
                     log.error(f"FlowSwap {swap_id}: M1 HTLC3S manager not available — background scheduler will refund via timelock")
-            else:
+            elif m1_claimed:
                 log.info(f"FlowSwap {swap_id}: M1 already claimed, skipping")
+            elif not fs.get("m1_htlc_outpoint"):
+                log.error(f"FlowSwap {swap_id}: No m1_htlc_outpoint — M1 was never locked, skipping M1 claim")
 
-            # Mark complete — user already received assets (EVM USDC).
-            # If M1 claim failed, flag it so background scheduler recovers via timelock refund.
+            # Mark complete only if USDC was delivered to user.
+            # If USDC claim failed, stay in COMPLETING so watcher can retry.
             with _flowswap_lock:
-                fs["state"] = FlowSwapState.COMPLETED.value
-                fs["completed_at"] = int(time.time())
+                if evm_claimed:
+                    fs["state"] = FlowSwapState.COMPLETED.value
+                    fs["completed_at"] = int(time.time())
+                    if not m1_claimed:
+                        fs["m1_claim_failed"] = True
+                    _release_reservation(swap_id)
+                else:
+                    fs["evm_claim_failed"] = True
+                    if not m1_claimed:
+                        fs["m1_claim_failed"] = True
+                    # Stay in COMPLETING — watcher thread will retry EVM claim
+                    log.error(f"FlowSwap {swap_id}: USDC NOT delivered — staying in COMPLETING for retry")
                 fs["updated_at"] = int(time.time())
-                if not m1_claimed:
-                    fs["m1_claim_failed"] = True
-                _release_reservation(swap_id)
                 _save_flowswap_db()
-            log.info(f"FlowSwap {swap_id}: COMPLETED (m1_claimed={m1_claimed})")
+            log.info(f"FlowSwap {swap_id}: {'COMPLETED' if evm_claimed else 'COMPLETING (USDC retry needed)'} (evm={evm_claimed}, m1={m1_claimed})")
 
         except Exception as e:
             log.error(f"FlowSwap {swap_id}: completion error: {e}")
@@ -5309,6 +5681,192 @@ async def _presign_reverse(swap_id: str, fs: Dict, req: FlowSwapPresignRequest):
         "btc_destination": fs.get("user_btc_address", ""),
         "next_step": f"Poll GET /api/flowswap/{swap_id} for completion",
     }
+
+
+# =============================================================================
+# MANUAL BTC REFUND
+# =============================================================================
+
+@app.post("/api/flowswap/{swap_id}/refund-btc")
+async def flowswap_refund_btc(swap_id: str):
+    """
+    Manually trigger BTC HTLC refund after timelock expiry.
+    Returns the refund txid or diagnostic info.
+    """
+    if swap_id not in flowswap_db:
+        raise HTTPException(404, "FlowSwap not found")
+
+    fs = flowswap_db[swap_id]
+
+    # Already refunded?
+    if fs.get("btc_refund_txid"):
+        return {"status": "already_refunded", "txid": fs["btc_refund_txid"]}
+
+    # Check required fields
+    diag = {
+        "swap_id": swap_id,
+        "state": fs.get("state"),
+        "has_redeem_script": bool(fs.get("btc_redeem_script")),
+        "has_htlc_address": bool(fs.get("btc_htlc_address")),
+        "has_fund_txid": bool(fs.get("btc_fund_txid")),
+        "timelock": fs.get("btc_timelock", 0),
+        "refund_address": fs.get("user_btc_refund_address", ""),
+    }
+
+    btc_3s = get_btc_htlc_3s()
+    if not btc_3s:
+        diag["error"] = "BTC client not available"
+        return diag
+
+    # Check current height vs timelock
+    try:
+        current_height = btc_3s.client.get_block_count()
+        diag["current_height"] = current_height
+    except Exception as e:
+        diag["error"] = f"Cannot get BTC height: {e}"
+        return diag
+
+    timelock = fs.get("btc_timelock", 0)
+    if not timelock or current_height < timelock:
+        diag["error"] = f"Timelock not expired: {current_height} < {timelock}"
+        return diag
+
+    redeem_script = fs.get("btc_redeem_script")
+    if not redeem_script:
+        diag["error"] = "No redeem_script stored — cannot build refund TX"
+        return diag
+
+    # Find the UTXO
+    htlc_address = fs.get("btc_htlc_address", "")
+    amount_sats = fs.get("btc_amount_sats", 0)
+    utxo = None
+    try:
+        utxo = btc_3s.check_htlc_funded(
+            htlc_address=htlc_address,
+            expected_amount=amount_sats,
+            min_confirmations=0,
+        )
+    except Exception:
+        pass
+
+    # Fallback: gettxout
+    if not utxo and fs.get("btc_fund_txid"):
+        for vout_idx in range(4):
+            try:
+                txout = btc_3s.client._call("gettxout", fs["btc_fund_txid"], vout_idx, True)
+                if txout:
+                    spk = txout.get("scriptPubKey", {})
+                    addr = spk.get("address", "")
+                    if not addr:
+                        addrs = spk.get("addresses", [])
+                        addr = addrs[0] if addrs else ""
+                    if addr == htlc_address:
+                        utxo = {
+                            "txid": fs["btc_fund_txid"],
+                            "vout": vout_idx,
+                            "amount": amount_sats,
+                            "confirmations": txout.get("confirmations", 1),
+                        }
+                        break
+            except Exception:
+                pass
+
+    if not utxo:
+        diag["error"] = "UTXO not found (already spent or claimed?)"
+        return diag
+
+    # Determine refund address
+    refund_to = fs.get("user_btc_refund_address", "")
+    if not refund_to:
+        lp_btc_key = _load_lp_btc_key()
+        refund_to = lp_btc_key.get("address", "")
+    if not refund_to:
+        diag["error"] = "No refund address"
+        return diag
+
+    # Get refund key (WIF needed for manual witness construction —
+    # signrawtransactionwithwallet can't handle custom P2WSH HTLC scripts)
+    lp_btc_key = _load_lp_btc_key()
+    refund_wif = lp_btc_key.get("claim_wif", "")
+    diag["has_claim_wif_in_json"] = bool(refund_wif)
+    if not refund_wif:
+        # Try dumpprivkey (works for legacy wallets)
+        lp_address = lp_btc_key.get("address", "")
+        diag["lp_btc_address"] = lp_address
+        if lp_address:
+            try:
+                refund_wif = btc_3s.client._call("dumpprivkey", lp_address)
+                diag["wif_source"] = "dumpprivkey"
+                log.info(f"Dumped WIF for {lp_address[:12]}... from wallet")
+            except Exception as e:
+                diag["dumpprivkey_error"] = str(e)
+                log.warning(f"Cannot dump privkey for {lp_address}: {e}")
+                # Fallback: extract from descriptor wallet
+                try:
+                    descs = btc_3s.client._call("listdescriptors", True)
+                    if descs and isinstance(descs, dict):
+                        import re as _re
+                        for d in descs.get("descriptors", []):
+                            desc_str = d.get("desc", "")
+                            # Match WIF keys: start with c (testnet/signet compressed)
+                            # Descriptors look like: wpkh([fp/path]cVxxx...)#checksum
+                            wif_match = _re.search(r'([cK][a-km-zA-HJ-NP-Z1-9]{50,52})', desc_str)
+                            if wif_match:
+                                candidate_wif = wif_match.group(1)
+                                # Verify it's a valid WIF by trying to use it
+                                try:
+                                    from bitcoin import SelectParams
+                                    from bitcoin.wallet import CBitcoinSecret
+                                    SelectParams('signet')
+                                    key_obj = CBitcoinSecret(candidate_wif)
+                                    candidate_pub = key_obj.pub.hex()
+                                    # Check if pubkey matches btc.json
+                                    lp_pubkey = lp_btc_key.get("pubkey", "")
+                                    if lp_pubkey and candidate_pub == lp_pubkey:
+                                        refund_wif = candidate_wif
+                                        diag["wif_source"] = "listdescriptors (pubkey match)"
+                                        break
+                                    elif not lp_pubkey:
+                                        # No pubkey to match, use first valid WIF
+                                        refund_wif = candidate_wif
+                                        diag["wif_source"] = "listdescriptors (first valid)"
+                                        break
+                                except Exception:
+                                    continue  # Not a valid WIF, try next
+                        if not refund_wif:
+                            # Log descriptor format for debugging
+                            sample = [d.get("desc", "")[:60] for d in descs.get("descriptors", [])[:3]]
+                            diag["descriptor_samples"] = sample
+                except Exception as e2:
+                    diag["listdescriptors_error"] = str(e2)
+
+    diag["has_wif"] = bool(refund_wif)
+
+    # Execute refund
+    try:
+        refund_txid = btc_3s.refund_htlc_3s(
+            utxo=utxo,
+            redeem_script=redeem_script,
+            refund_address=refund_to,
+            refund_privkey_wif=refund_wif,
+            timelock=timelock,
+        )
+        with _flowswap_lock:
+            fs["btc_refund_txid"] = refund_txid
+            fs["state"] = FlowSwapState.REFUNDED.value
+            fs["updated_at"] = int(time.time())
+            _release_reservation(swap_id)
+            _save_flowswap_db()
+
+        return {
+            "status": "refunded",
+            "txid": refund_txid,
+            "amount_sats": amount_sats,
+            "refund_address": refund_to,
+        }
+    except Exception as e:
+        diag["error"] = f"Refund failed: {e}"
+        return diag
 
 
 # =============================================================================
@@ -6677,13 +7235,15 @@ async def get_wallets():
                 except ValueError:
                     pass
 
-            # Fallback: scantxoutset for specific address
+            # Fallback: scantxoutset for specific address (acquire global lock)
             if not btc_balance_found and _lp_addresses.get("btc"):
+                from sdk.chains.btc import _scantxoutset_lock
                 scan_arg = json.dumps([f"addr({_lp_addresses['btc']})"])
-                result = subprocess.run(
-                    btc_base_cmd + ["scantxoutset", "start", scan_arg],
-                    capture_output=True, text=True, timeout=30
-                )
+                with _scantxoutset_lock:
+                    result = subprocess.run(
+                        btc_base_cmd + ["scantxoutset", "start", scan_arg],
+                        capture_output=True, text=True, timeout=30
+                    )
                 if result.returncode == 0:
                     try:
                         scan = json.loads(result.stdout.strip())
@@ -6733,7 +7293,9 @@ async def get_wallets():
 
             wallets["m1"]["address"] = _lp_addresses["m1"]
 
-            # Get M1 balance from getwalletstate (M1 receipts, not regular UTXOs)
+            # Get M1 balance from getwalletstate
+            # Effective M1 = M0 available + M1 receipts (M0→M1 is free and instant)
+            # BATHRON: ValueFromAmount returns raw sats (1 M0 = 1 sat)
             result = subprocess.run(
                 m1_base_cmd + ["getwalletstate", "true"],
                 capture_output=True, text=True, timeout=10
@@ -6741,16 +7303,25 @@ async def get_wallets():
             if result.returncode == 0:
                 try:
                     wallet_state = json.loads(result.stdout.strip())
+                    m0_balance = int(wallet_state.get("m0", {}).get("balance", 0))
                     m1_state = wallet_state.get("m1", {})
-                    # M1 total is in coins (from ValueFromAmount)
-                    m1_total = m1_state.get("total", 0)
                     receipts = m1_state.get("receipts", [])
-                    # Calculate pending (0 confirmations)
-                    confirmed = sum(r.get("amount", 0) for r in receipts if r.get("confirmations", 0) > 0)
-                    pending = sum(r.get("amount", 0) for r in receipts if r.get("confirmations", 0) == 0)
-                    wallets["m1"]["balance"] = confirmed
-                    wallets["m1"]["pending"] = pending
-                    log.info(f"M1 balance: {confirmed} confirmed, {pending} pending ({len(receipts)} receipts)")
+                    m1_confirmed = sum(
+                        int(r.get("amount", 0))
+                        for r in receipts if r.get("confirmations", 0) > 0
+                    )
+                    m1_pending = sum(
+                        int(r.get("amount", 0))
+                        for r in receipts if r.get("confirmations", 0) == 0
+                    )
+                    # Show M0 + confirmed M1 as effective balance
+                    wallets["m1"]["balance"] = m0_balance + m1_confirmed
+                    wallets["m1"]["pending"] = m1_pending
+                    wallets["m1"]["m0_component"] = m0_balance
+                    wallets["m1"]["m1_component"] = m1_confirmed
+                    log.info(f"M1 wallet: M0={m0_balance} + M1={m1_confirmed} "
+                             f"= {m0_balance + m1_confirmed} sats "
+                             f"(+{m1_pending} pending, {len(receipts)} receipts)")
                 except json.JSONDecodeError as e:
                     log.error(f"Failed to parse M1 getwalletstate: {e}")
             else:
@@ -8472,6 +9043,142 @@ def stop_evm_watcher():
 
 
 # =============================================================================
+# BTC DEPOSIT WATCHER — auto-detects user BTC deposits for AWAITING_BTC swaps
+# =============================================================================
+
+_btc_deposit_watcher_running = False
+_btc_deposit_watcher_thread = None
+BTC_DEPOSIT_WATCHER_INTERVAL = 15  # seconds between scans
+
+
+def _btc_deposit_watcher_loop():
+    """Background thread: polls BTC chain for deposits to FlowSwap HTLC addresses.
+
+    For swaps in AWAITING_BTC state, checks if the user has sent BTC
+    to the HTLC address. If funded (with required confirmations), auto-triggers
+    the same logic as POST /flowswap/{id}/btc-funded.
+    """
+    global _btc_deposit_watcher_running
+    _btc_deposit_watcher_running = True
+    log.info("BTC deposit watcher started — auto-detecting user BTC deposits")
+
+    while _btc_deposit_watcher_running:
+        try:
+            _btc_deposit_check_all()
+        except Exception as e:
+            log.error(f"BTC deposit watcher error: {e}")
+        time.sleep(BTC_DEPOSIT_WATCHER_INTERVAL)
+
+
+def _btc_deposit_check_all():
+    """Scan all AWAITING_BTC / BTC_FUNDED swaps and auto-advance if funded."""
+    candidates = []
+    with _flowswap_lock:
+        for swap_id, fs in flowswap_db.items():
+            if fs.get("state") not in (FlowSwapState.AWAITING_BTC.value,
+                                       FlowSwapState.BTC_FUNDED.value):
+                continue
+            # Skip if LP lock already in progress
+            if fs.get("_lp_locking"):
+                continue
+            # Skip expired plans ONLY if BTC was never sent
+            if fs.get("plan_expires_at") and int(time.time()) > fs["plan_expires_at"]:
+                if not fs.get("btc_fund_txid"):
+                    continue
+            if not fs.get("btc_htlc_address"):
+                continue
+            candidates.append((swap_id, dict(fs)))
+
+    if not candidates:
+        return
+
+    btc_3s = get_btc_htlc_3s()
+    if not btc_3s:
+        return
+
+    for swap_id, fs_copy in candidates:
+        try:
+            _btc_deposit_check_one(swap_id, fs_copy, btc_3s)
+        except Exception as e:
+            log.error(f"BTC deposit watcher: error checking {swap_id}: {e}")
+
+
+def _btc_deposit_check_one(swap_id: str, fs_copy: dict, btc_3s):
+    """Check a single AWAITING_BTC swap for BTC deposit and auto-advance."""
+    required_confs = _get_required_confirmations(fs_copy["btc_amount_sats"])
+
+    utxo = btc_3s.check_htlc_funded(
+        htlc_address=fs_copy["btc_htlc_address"],
+        expected_amount=fs_copy["btc_amount_sats"],
+        min_confirmations=required_confs,
+    )
+
+    # Fallback: if we already have a fund_txid, check it directly via getrawtransaction
+    # (fast — no scantxoutset needed). Respects required_confs including 0.
+    if not utxo and fs_copy.get("btc_fund_txid"):
+        try:
+            raw = btc_3s.client._call("getrawtransaction", fs_copy["btc_fund_txid"], True)
+            if raw and raw.get("confirmations", 0) >= required_confs:
+                log.info(f"BTC deposit watcher {swap_id}: TX {fs_copy['btc_fund_txid'][:16]}... "
+                         f"found via getrawtransaction ({raw['confirmations']} confs)")
+                utxo = {
+                    "txid": fs_copy["btc_fund_txid"],
+                    "vout": 0,
+                    "amount": fs_copy["btc_amount_sats"],
+                    "confirmations": raw["confirmations"],
+                }
+        except Exception as e:
+            log.debug(f"BTC deposit watcher {swap_id}: getrawtransaction fallback failed: {e}")
+
+    if not utxo:
+        return  # Not funded yet
+
+    # Auto-detect sender address
+    sender_address = ""
+    if not fs_copy.get("user_btc_refund_address"):
+        sender_address = _detect_btc_sender(btc_3s, utxo["txid"])
+        if sender_address:
+            log.info(f"BTC deposit watcher {swap_id}: auto-detected refund address: {sender_address}")
+
+    with _flowswap_lock:
+        fs_live = flowswap_db.get(swap_id)
+        if not fs_live:
+            return
+        # Skip if already advanced past BTC_FUNDED by another thread
+        if fs_live["state"] not in (FlowSwapState.AWAITING_BTC.value,
+                                    FlowSwapState.BTC_FUNDED.value):
+            return
+
+        fs_live["btc_fund_txid"] = utxo["txid"]
+        fs_live["btc_fund_confs"] = utxo.get("confirmations", 0)
+        if sender_address:
+            fs_live["user_btc_refund_address"] = sender_address
+        fs_live["state"] = FlowSwapState.BTC_FUNDED.value
+        fs_live["updated_at"] = int(time.time())
+        _reserve_inventory(swap_id, m1_sats=fs_live.get("m1_amount_sats", 0),
+                           usdc=fs_live.get("usdc_amount", 0))
+        _save_flowswap_db()
+
+    ws_notify_swap(swap_id)
+
+    log.info(f"BTC deposit watcher: {swap_id} auto-funded, txid={utxo['txid']}, "
+             f"confs={utxo['confirmations']}, required={required_confs}")
+
+    # Launch LP locking in background thread
+    threading.Thread(
+        target=_do_lp_lock_forward,
+        args=(swap_id,),
+        daemon=True,
+    ).start()
+
+
+def stop_btc_deposit_watcher():
+    """Stop the BTC deposit watcher thread."""
+    global _btc_deposit_watcher_running
+    _btc_deposit_watcher_running = False
+
+
+# =============================================================================
 # PER-LEG WATCHER — LP_OUT auto-detects BTC claims without frontend relay
 # =============================================================================
 
@@ -9455,13 +10162,186 @@ async def admin_cleanup_terminal(request: Request, max_age_hours: int = 24):
 
 
 # =============================================================================
+# WEBSOCKET ENDPOINT
+# =============================================================================
+
+def _build_flowswap_status_dict(fs: dict, swap_id: str) -> dict:
+    """Build flowswap status dict (sync, no I/O). Reused by WS broadcasts."""
+    state = fs.get("state", "unknown")
+    btc_sats = fs.get("btc_amount_sats", 0)
+    btc_amount = btc_sats / 100_000_000
+    m1_sats = fs.get("m1_amount_sats", 0)
+    usdc_amount = fs.get("usdc_amount", 0)
+    rate_exec = usdc_amount / btc_amount if btc_amount > 0 else 0
+
+    result = {
+        "swap_id": fs.get("swap_id", swap_id),
+        "state": state,
+        "from_asset": fs.get("from_asset", "BTC"),
+        "to_asset": fs.get("to_asset", "USDC"),
+        "btc_amount_sats": btc_sats,
+        "usdc_amount": usdc_amount,
+        "rate_executed": round(rate_exec, 2),
+        "hashlocks": {
+            "H_user": fs.get("H_user", ""),
+            "H_lp1": fs.get("H_lp1", ""),
+            "H_lp2": fs.get("H_lp2", ""),
+        },
+        "btc": {
+            "htlc_address": fs.get("btc_htlc_address", ""),
+            "fund_txid": fs.get("btc_fund_txid"),
+            "claim_txid": fs.get("btc_claim_txid"),
+            "claim_confs": fs.get("btc_claim_confs", 0),
+            "refund_txid": fs.get("btc_refund_txid"),
+        },
+        "m1": {
+            "htlc_outpoint": fs.get("m1_htlc_outpoint", ""),
+            "txid": fs.get("m1_htlc_txid"),
+            "claim_txid": fs.get("m1_claim_txid"),
+        },
+        "evm": {
+            "htlc_id": fs.get("evm_htlc_id", ""),
+            "lock_txhash": fs.get("evm_lock_txhash"),
+            "claim_txhash": fs.get("evm_claim_txhash"),
+            "contract_address": HTLC3S_CONTRACT_ADDRESS,
+        },
+        "created_at": fs.get("created_at", 0),
+        "updated_at": fs.get("updated_at", 0),
+        "completed_at": fs.get("completed_at"),
+        "plan_expires_at": fs.get("plan_expires_at", 0),
+        "lp_locked_at": fs.get("lp_locked_at"),
+        "stability_check_until": fs.get("stability_check_until"),
+    }
+    if state == "failed" and fs.get("error"):
+        result["error"] = fs["error"]
+    if state in ("btc_claimed", "completing", "completed") and fs.get("S_lp1"):
+        result["secrets"] = {"S_lp1": fs.get("S_lp1", ""), "S_lp2": fs.get("S_lp2", "")}
+    return result
+
+
+def ws_notify_swap(swap_id: str):
+    """Fire-and-forget WS broadcast for a swap state change. Thread-safe."""
+    if not ws_manager.connections:
+        return
+    fs = flowswap_db.get(swap_id)
+    if not fs:
+        return
+    status = _build_flowswap_status_dict(fs, swap_id)
+    loop = _ws_event_loop
+    if loop and loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            ws_manager.broadcast_swap(swap_id, status), loop
+        )
+
+
+def ws_notify_inventory():
+    """Fire-and-forget WS broadcast for inventory change. Thread-safe."""
+    if not ws_manager.connections:
+        return
+    with _flowswap_lock:
+        avail = _get_available_inventory()
+    loop = _ws_event_loop
+    if loop and loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            ws_manager.broadcast("inventory", {"type": "inventory", "data": avail}), loop
+        )
+
+
+async def _ws_push_quote_updates():
+    """Push updated quotes to all WS clients subscribed to 'quotes'."""
+    for ws_id, conn in list(ws_manager.connections.items()):
+        sub = conn["subs"].get("quotes")
+        if not sub:
+            continue
+        from_a = sub.get("from")
+        to_a = sub.get("to")
+        amount = sub.get("amount")
+        if not (from_a and to_a and amount):
+            continue
+        try:
+            quote = await get_quote(from_asset=from_a, to_asset=to_a, amount=float(amount))
+            await ws_manager.send(ws_id, {"type": "quote", "data": quote.dict() if hasattr(quote, 'dict') else dict(quote)})
+        except Exception:
+            pass
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    ws_id = await ws_manager.connect(ws)
+
+    # Send initial lp_info on connect
+    try:
+        info = await get_lp_info()
+        await ws_manager.send(ws_id, {"type": "lp_info", "data": info})
+    except Exception:
+        pass
+
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            text = msg.get("text")
+            if not text:
+                continue
+            try:
+                raw = json.loads(text)
+            except (json.JSONDecodeError, Exception):
+                continue
+            msg_type = raw.get("type")
+
+            if msg_type == "subscribe":
+                channel = raw.get("channel")
+                data = raw.get("data", {})
+                ws_manager.subscribe(ws_id, channel, data)
+
+                if channel == "quotes" and data.get("from") and data.get("to") and data.get("amount"):
+                    try:
+                        quote = await get_quote(
+                            from_asset=data["from"], to_asset=data["to"],
+                            amount=float(data["amount"])
+                        )
+                        await ws_manager.send(ws_id, {"type": "quote", "data": quote.dict() if hasattr(quote, 'dict') else dict(quote)})
+                    except HTTPException as e:
+                        await ws_manager.send(ws_id, {"type": "error", "data": {"message": e.detail}})
+
+                elif channel == "swap" and data.get("swap_id"):
+                    sid = data["swap_id"]
+                    with _flowswap_lock:
+                        fs = flowswap_db.get(sid)
+                    if fs:
+                        status = _build_flowswap_status_dict(fs, sid)
+                        await ws_manager.send(ws_id, {"type": "swap_update", "data": status})
+
+                elif channel == "inventory":
+                    with _flowswap_lock:
+                        avail = _get_available_inventory()
+                    await ws_manager.send(ws_id, {"type": "inventory", "data": avail})
+
+            elif msg_type == "unsubscribe":
+                ws_manager.unsubscribe(ws_id, raw.get("channel", ""))
+
+            elif msg_type == "ping":
+                await ws_manager.send(ws_id, {"type": "pong"})
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.warning(f"WS error ({ws_id}): {e}")
+    finally:
+        ws_manager.disconnect(ws_id)
+        log.info(f"WS disconnected: {ws_id}")
+
+
+# =============================================================================
 # FASTAPI STARTUP/SHUTDOWN EVENTS
 # =============================================================================
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup."""
-    global _evm_watcher_thread
+    global _evm_watcher_thread, _ws_event_loop
+    _ws_event_loop = asyncio.get_event_loop()
 
     # Load persisted FlowSwap state
     _load_flowswap_db()
@@ -9483,6 +10363,9 @@ async def startup_event():
     # Configure price module with callback to update LP_CONFIG
     def _on_price_update(btc_price, usdc_m1_rate):
         LP_CONFIG["pairs"]["USDC/M1"]["rate"] = usdc_m1_rate
+        # Push updated quotes to WS subscribers
+        if _ws_event_loop and _ws_event_loop.is_running():
+            asyncio.run_coroutine_threadsafe(_ws_push_quote_updates(), _ws_event_loop)
     configure_prices(BTC_M1_FIXED_RATE, _on_price_update,
                      api_keys=_startup_api_keys)
 
@@ -9523,6 +10406,19 @@ async def startup_event():
     _evm_watcher_thread = threading.Thread(target=start_evm_watcher, daemon=True)
     _evm_watcher_thread.start()
 
+    # Abort any stale scantxoutset from previous server process
+    try:
+        btc_3s_init = get_btc_htlc_3s()
+        if btc_3s_init:
+            btc_3s_init.client._call_inner("scantxoutset", "abort", timeout=5)
+    except Exception:
+        pass  # No scan to abort — OK
+
+    # Start BTC deposit watcher (auto-detects user BTC deposits for AWAITING_BTC swaps)
+    global _btc_deposit_watcher_thread
+    _btc_deposit_watcher_thread = threading.Thread(target=_btc_deposit_watcher_loop, daemon=True)
+    _btc_deposit_watcher_thread.start()
+
     # Start per-leg watcher thread (LP_OUT auto-detects BTC claims)
     global _perleg_watcher_thread
     _perleg_watcher_thread = threading.Thread(target=_perleg_watcher_loop, daemon=True)
@@ -9547,6 +10443,37 @@ async def startup_event():
                 log.error(f"M1 auto-refund error: {e}")
     asyncio.create_task(_auto_refund_checker())
 
+    # --- WS swap state pusher: check subscribed swaps for changes every 1s ---
+    _ws_swap_cache: Dict[str, str] = {}  # swap_id -> last_pushed_state
+
+    async def _ws_swap_state_pusher():
+        """Push swap state changes to WS subscribers. Runs every 1s."""
+        while True:
+            await asyncio.sleep(1)
+            if not ws_manager.connections:
+                continue
+            try:
+                # Collect all swap_ids that WS clients are subscribed to
+                watched = set()
+                for conn in ws_manager.connections.values():
+                    sub = conn["subs"].get("swap")
+                    if sub and sub.get("swap_id"):
+                        watched.add(sub["swap_id"])
+
+                for sid in watched:
+                    fs = flowswap_db.get(sid)
+                    if not fs:
+                        continue
+                    current_state = fs.get("state", "")
+                    last_state = _ws_swap_cache.get(sid)
+                    if current_state != last_state:
+                        _ws_swap_cache[sid] = current_state
+                        status = _build_flowswap_status_dict(fs, sid)
+                        await ws_manager.broadcast_swap(sid, status)
+            except Exception:
+                pass
+    asyncio.create_task(_ws_swap_state_pusher())
+
     # --- Startup recovery: rebuild reservations + recover all stuck swaps ---
     with _flowswap_lock:
         _rebuild_reservations_from_db()
@@ -9560,6 +10487,7 @@ async def shutdown_event():
     """Cleanup on shutdown."""
     _save_flowswap_db()
     stop_evm_watcher()
+    stop_btc_deposit_watcher()
     stop_perleg_watcher()
     await close_prices_httpx()
     log.info("Swap monitor stopped")

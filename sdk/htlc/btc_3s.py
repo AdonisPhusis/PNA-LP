@@ -371,7 +371,8 @@ class BTCHTLC3S:
         """
         Check if HTLC has been funded.
 
-        Uses scantxoutset for confirmed UTXOs, and mempool scan for 0-conf.
+        Order: mempool (0-conf, instant) → gettxout (confirmed, instant)
+               → scantxoutset (slow last resort).
 
         Args:
             htlc_address: HTLC address to check
@@ -383,31 +384,7 @@ class BTCHTLC3S:
         """
         import json
 
-        # 1. Check confirmed UTXO set
-        try:
-            scan_result = self.client._call(
-                "scantxoutset", "start",
-                json.dumps([f"addr({htlc_address})"])
-            )
-
-            if scan_result and scan_result.get("success"):
-                current_height = scan_result.get("height", 0)
-                for utxo in scan_result.get("unspents", []):
-                    amount_sats = int(round(utxo["amount"] * 100_000_000))
-                    utxo_height = utxo.get("height", current_height)
-                    confirmations = current_height - utxo_height + 1 if utxo_height > 0 else 0
-
-                    if amount_sats >= expected_amount and confirmations >= min_confirmations:
-                        return {
-                            "txid": utxo["txid"],
-                            "vout": utxo["vout"],
-                            "amount": amount_sats,
-                            "confirmations": confirmations,
-                        }
-        except Exception as e:
-            log.error(f"scantxoutset failed: {e}")
-
-        # 2. If 0-conf accepted, scan mempool for unconfirmed TX to HTLC address
+        # 1. FAST: If 0-conf accepted, scan mempool FIRST (instant per-TX lookup)
         if min_confirmations == 0:
             try:
                 mempool_txids = self.client._call("getrawmempool")
@@ -437,6 +414,36 @@ class BTCHTLC3S:
                             continue  # Skip TXs we can't decode
             except Exception as e:
                 log.error(f"Mempool scan failed: {e}")
+
+        # 2. FAST: gettxout — direct UTXO set lookup by address (no full scan)
+        #    Bitcoin Core derives the txid from the address for P2WSH outputs.
+        #    We check recent blocks' coinbase-style outputs. For HTLC P2WSH,
+        #    we need to try scantxoutset as gettxout needs (txid, vout).
+        #    Skip this step — gettxout requires a known txid (handled by caller).
+
+        # 3. SLOW: scantxoutset — full UTXO set scan (30s+ on Signet)
+        try:
+            scan_result = self.client._call(
+                "scantxoutset", "start",
+                json.dumps([f"addr({htlc_address})"])
+            )
+
+            if scan_result and scan_result.get("success"):
+                current_height = scan_result.get("height", 0)
+                for utxo in scan_result.get("unspents", []):
+                    amount_sats = int(round(utxo["amount"] * 100_000_000))
+                    utxo_height = utxo.get("height", current_height)
+                    confirmations = current_height - utxo_height + 1 if utxo_height > 0 else 0
+
+                    if amount_sats >= expected_amount and confirmations >= min_confirmations:
+                        return {
+                            "txid": utxo["txid"],
+                            "vout": utxo["vout"],
+                            "amount": amount_sats,
+                            "confirmations": confirmations,
+                        }
+        except Exception as e:
+            log.error(f"scantxoutset failed: {e}")
 
         return None
 
@@ -1174,47 +1181,19 @@ class BTCHTLC3S:
         utxo: Dict,
         redeem_script: str,
     ) -> str:
-        """Sign refund using Bitcoin Core wallet (no WIF needed).
+        """Sign refund using Bitcoin Core wallet key.
 
-        Bitcoin Core handles P2WSH HTLC ELSE branch natively —
-        signrawtransactionwithwallet produces the correct witness directly.
+        Bitcoin Core's signrawtransactionwithwallet can't handle custom
+        P2WSH HTLC scripts (doesn't know which branch to execute).
+
+        Requires 'claim_wif' in btc.json. Use extract_btc_wif.py to
+        export it from the descriptor wallet.
         """
-        import json as _json
-
-        txid = utxo["txid"]
-        vout = utxo["vout"]
-        amount_sats = utxo["amount"]
-        amount_btc = amount_sats / 100_000_000
-
-        script_bytes = bytes.fromhex(redeem_script)
-        witness_program = sha256(script_bytes)
-        script_pubkey_hex = (bytes([OP_0, 0x20]) + witness_program).hex()
-
-        prevtxs = [{
-            "txid": txid,
-            "vout": vout,
-            "scriptPubKey": script_pubkey_hex,
-            "witnessScript": redeem_script,
-            "amount": f"{amount_btc:.8f}",
-        }]
-
-        result = self.client._call(
-            "signrawtransactionwithwallet",
-            unsigned_tx,
-            _json.dumps(prevtxs),
+        raise RuntimeError(
+            "signrawtransactionwithwallet cannot sign custom P2WSH HTLC scripts. "
+            "Run extract_btc_wif.py on the LP node to export claim_wif to btc.json, "
+            "then retry."
         )
-
-        if not result:
-            raise RuntimeError("signrawtransactionwithwallet returned nothing")
-
-        if isinstance(result, str):
-            result = _json.loads(result)
-
-        if not result.get("complete"):
-            errors = result.get("errors", [])
-            raise RuntimeError(f"signrawtransactionwithwallet failed: {errors}")
-
-        return result["hex"]
 
 
 # Convenience functions for standalone use

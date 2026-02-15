@@ -7,11 +7,16 @@ Supports Bitcoin Core RPC for Signet/Testnet/Mainnet.
 import json
 import logging
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
+
+# Bitcoin Core only allows one scantxoutset at a time (global lock).
+# All threads that call scantxoutset MUST acquire this before the RPC call.
+_scantxoutset_lock = threading.Lock()
 
 
 @dataclass
@@ -94,7 +99,31 @@ class BTCClient:
         return cmd
 
     def _call(self, method: str, *args, timeout: int = 30) -> Any:
-        """Execute RPC call via CLI."""
+        """Execute RPC call via CLI.
+
+        For scantxoutset: auto-acquires global lock since Bitcoin Core
+        only supports one concurrent scan.  On timeout, aborts the
+        Bitcoin Core scan so subsequent calls don't hit "already in progress".
+        """
+        use_scan_lock = (method == "scantxoutset")
+        if use_scan_lock:
+            _scantxoutset_lock.acquire()
+        try:
+            return self._call_inner(method, *args, timeout=timeout)
+        except RuntimeError as e:
+            if use_scan_lock and "timeout" in str(e).lower():
+                # Bitcoin Core still running the scan — abort it
+                try:
+                    self._call_inner("scantxoutset", "abort", timeout=5)
+                except Exception:
+                    pass
+            raise
+        finally:
+            if use_scan_lock:
+                _scantxoutset_lock.release()
+
+    def _call_inner(self, method: str, *args, timeout: int = 30) -> Any:
+        """Execute RPC call via CLI (no locking)."""
         cmd = self._build_cmd(method, *args)
 
         try:

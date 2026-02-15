@@ -974,7 +974,8 @@ function renderPairDetail(pairId, pair, meta) {
     const spreadBid = pair.spread_bid ?? 0.5;
     const spreadAsk = pair.spread_ask ?? 0.5;
     const minVal = pair.min ?? 0;
-    const maxVal = pair.max ?? 0;
+    const maxPct = pair.max_percent ?? 100;
+    const available = pair.available ?? 0;
 
     let html = '';
 
@@ -1033,10 +1034,15 @@ function renderPairDetail(pairId, pair, meta) {
                 </div>
             </div>
             <div class="detail-field">
-                <label>Max Inventory</label>
+                <label>Max % / Swap</label>
                 <div class="inline-input">
-                    <input type="number" id="pair-${slug}-max" value="${maxVal}" step="0.1">
-                    <span>${meta.unit}</span>
+                    <input type="number" id="pair-${slug}-max-pct" value="${maxPct}" min="1" max="100" step="1"
+                        onchange="onPairFieldChange('${pairId}')">
+                    <span>%</span>
+                </div>
+                <div class="computed-max" id="pair-${slug}-computed-max"
+                    style="font-size:0.8em;color:#8b949e;margin-top:2px">
+                    = ${(available * maxPct / 100).toFixed(6)} ${meta.unit}
                 </div>
             </div>
         </div>
@@ -1053,6 +1059,18 @@ function onPairFieldChange(pairId) {
     const ask = parseFloat(document.getElementById(`pair-${slug}-spread-ask`)?.value) || 0;
     _cachedLpConfig.pairs[pairId].spread_bid = bid;
     _cachedLpConfig.pairs[pairId].spread_ask = ask;
+
+    // Update computed max display
+    const pctEl = document.getElementById(`pair-${slug}-max-pct`);
+    const computedEl = document.getElementById(`pair-${slug}-computed-max`);
+    if (pctEl && computedEl) {
+        const pct = parseFloat(pctEl.value) || 100;
+        const avail = _cachedLpConfig.pairs[pairId].available ?? 0;
+        const unit = PAIR_META[pairId]?.unit ?? '';
+        computedEl.textContent = `= ${(avail * pct / 100).toFixed(6)} ${unit}`;
+        _cachedLpConfig.pairs[pairId].max_percent = pct;
+    }
+
     // Re-render just the book row spread display
     renderSettlementBook(_cachedLpConfig);
 }
@@ -1470,9 +1488,9 @@ async function pushConfigToServer() {
         const spreadBid = parseFloat(document.getElementById(`pair-${slug}-spread-bid`)?.value) || 0.5;
         const spreadAsk = parseFloat(document.getElementById(`pair-${slug}-spread-ask`)?.value) || 0.5;
         const min = parseFloat(document.getElementById(`pair-${slug}-min`)?.value) || 0;
-        const max = parseFloat(document.getElementById(`pair-${slug}-max`)?.value) || 0;
+        const max_percent = parseInt(document.getElementById(`pair-${slug}-max-pct`)?.value) || 100;
 
-        pairs[pairId] = { enabled, spread_bid: spreadBid, spread_ask: spreadAsk, min, max };
+        pairs[pairId] = { enabled, spread_bid: spreadBid, spread_ask: spreadAsk, min, max_percent };
 
         // For non-fixed pairs, include live rate if available
         if (!meta.fixed && _cachedLpConfig?.pairs?.[pairId]?._liveRate) {

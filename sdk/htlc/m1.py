@@ -285,17 +285,13 @@ class M1Htlc:
             return receipt
 
         # Check M0 balance and lock
-        # get_balance returns the result of 'getbalance' RPC which is either:
-        # - a float (simple balance)
-        # - a dict with 'total', 'm0', 'locked', etc.
+        # BATHRON: 1 M0 = 1 sat, getbalance returns integer sats directly
         m0_data = self.client.get_balance()
 
         if isinstance(m0_data, dict):
-            # getbalance returns coins (float), convert to sats for comparison
-            m0_coins = m0_data.get("m0", 0) - m0_data.get("locked", 0)
-            m0_balance = int(round(m0_coins * 100_000_000))
+            m0_balance = int(m0_data.get("m0", 0)) - int(m0_data.get("locked", 0))
         elif isinstance(m0_data, (int, float)):
-            m0_balance = int(round(m0_data * 100_000_000)) if isinstance(m0_data, float) else m0_data
+            m0_balance = int(m0_data)
         else:
             m0_balance = 0
 
@@ -304,8 +300,8 @@ class M1Htlc:
         if m0_balance < amount:
             raise RuntimeError(f"Insufficient balance. Need {amount}, have {m0_balance}")
 
-        # Lock M0 -> M1
-        log.info(f"Locking {amount} M0 -> M1")
+        # BATHRON: 1 M0 = 1 sat, RPC lock expects integer sats directly
+        log.info(f"Locking {amount} M0 -> M1 (sats)")
         result = self.client.lock(amount)
 
         if not result or not result.get("txid"):

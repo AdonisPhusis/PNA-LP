@@ -492,27 +492,46 @@ class EVMHTLC3S:
                 abi=HTLC3S_ABI
             )
 
-            nonce = w3.eth.get_transaction_count(sender, 'pending')
-            gas_price = int(w3.eth.gas_price * 1.1)
+            # Retry with gas bumping for nonce conflicts (stuck pending TXs)
+            tx_hash = None
+            for attempt in range(3):
+                gas_multiplier = 1.1 * (2 ** attempt)  # 1.1x, 2.2x, 4.4x
+                nonce = w3.eth.get_transaction_count(sender, 'latest')
+                gas_price = int(w3.eth.gas_price * gas_multiplier)
 
-            create_tx = contract.functions.create(
-                Web3.to_checksum_address(recipient),
-                Web3.to_checksum_address(token),
-                amount_wei,
-                bytes.fromhex(H_user[2:]),
-                bytes.fromhex(H_lp1[2:]),
-                bytes.fromhex(H_lp2[2:]),
-                timelock
-            ).build_transaction({
-                'from': sender,
-                'nonce': nonce,
-                'gas': 350000,
-                'gasPrice': gas_price,
-                'chainId': self.chain_id
-            })
+                create_tx = contract.functions.create(
+                    Web3.to_checksum_address(recipient),
+                    Web3.to_checksum_address(token),
+                    amount_wei,
+                    bytes.fromhex(H_user[2:]),
+                    bytes.fromhex(H_lp1[2:]),
+                    bytes.fromhex(H_lp2[2:]),
+                    timelock
+                ).build_transaction({
+                    'from': sender,
+                    'nonce': nonce,
+                    'gas': 350000,
+                    'gasPrice': gas_price,
+                    'chainId': self.chain_id
+                })
 
-            signed = account.sign_transaction(create_tx)
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                signed = account.sign_transaction(create_tx)
+                try:
+                    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                    break  # Success
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if 'replacement transaction underpriced' in err_msg or 'nonce too low' in err_msg:
+                        if attempt < 2:
+                            log.warning(f"EVM nonce conflict (attempt {attempt+1}), "
+                                        f"bumping gas {gas_multiplier:.1f}x...")
+                            import time as _time
+                            _time.sleep(2)
+                            continue
+                    raise  # Non-retryable error
+
+            if not tx_hash:
+                return HTLC3SResult(success=False, error="EVM TX send failed after retries")
 
             log.info(f"Create TX: {tx_hash.hex()}")
 
