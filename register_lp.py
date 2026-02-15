@@ -5,13 +5,18 @@ PNA LP Registration — On-chain OP_RETURN TX
 Registers (or unregisters) an LP on the BATHRON chain by sending a standard TX
 with an OP_RETURN output containing: PNA|LP|01|<endpoint_url>
 
+For Tier 1 (MN-backed), the TX must be sent from the operator's derived address.
+Use --operator-pubkey to derive the address from the MN operator public key.
+
 Usage:
     python3 register_lp.py --endpoint "http://57.131.33.152:8080"
+    python3 register_lp.py --endpoint "http://57.131.33.152:8080" --operator-pubkey <66hex>
     python3 register_lp.py --unregister
     python3 register_lp.py --status
 """
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -36,6 +41,43 @@ CLI_PATHS = [
     Path("/usr/local/bin/bathron-cli"),
     Path.home() / "bathron-cli",
 ]
+
+
+# =============================================================================
+# ADDRESS DERIVATION (operator pubkey -> P2PKH address)
+# =============================================================================
+
+_BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+_TESTNET_PUBKEY_VERSION = 139  # base58Prefixes[PUBKEY_ADDRESS] from chainparams.cpp
+
+
+def _base58_encode(data: bytes) -> str:
+    """Base58 encode raw bytes."""
+    n = int.from_bytes(data, 'big')
+    result = ''
+    while n > 0:
+        n, r = divmod(n, 58)
+        result = _BASE58_ALPHABET[r] + result
+    for byte in data:
+        if byte == 0:
+            result = _BASE58_ALPHABET[0] + result
+        else:
+            break
+    return result
+
+
+def pubkey_to_address(pubkey_hex: str,
+                      version: int = _TESTNET_PUBKEY_VERSION) -> str:
+    """Derive P2PKH address from compressed ECDSA secp256k1 public key."""
+    pubkey_bytes = bytes.fromhex(pubkey_hex)
+    if len(pubkey_bytes) != 33:
+        print(f"ERROR: Expected 33-byte compressed pubkey, got {len(pubkey_bytes)}")
+        sys.exit(1)
+    sha = hashlib.sha256(pubkey_bytes).digest()
+    h160 = hashlib.new('ripemd160', sha).digest()
+    versioned = bytes([version]) + h160
+    checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
+    return _base58_encode(versioned + checksum)
 
 
 # =============================================================================
@@ -187,13 +229,21 @@ def build_and_send_tx(cli: Path, op_return_data: bytes) -> str:
         print("ERROR: No spendable UTXOs found. Fund this wallet first.")
         sys.exit(1)
 
-    # Pick the first UTXO with enough balance for the fee
+    # Pick a UTXO with enough balance for the fee.
+    # If --address was specified, prefer UTXOs at that address (for tier matching).
     # BATHRON amounts are in raw satoshis (integer)
+    preferred_addr = getattr(build_and_send_tx, '_preferred_address', None)
     utxo = None
+    fallback_utxo = None
     for u in utxos:
         if int(u["amount"]) >= MIN_FEE_SATS * 2:
-            utxo = u
-            break
+            if preferred_addr and u.get("address") == preferred_addr:
+                utxo = u
+                break
+            if fallback_utxo is None:
+                fallback_utxo = u
+    if utxo is None:
+        utxo = fallback_utxo
 
     if not utxo:
         print(f"ERROR: No UTXO with balance >= {MIN_FEE_SATS * 2} sats")
@@ -330,10 +380,29 @@ def main():
         "--status", action="store_true",
         help="Show wallet status"
     )
+    parser.add_argument(
+        "--operator-pubkey", type=str,
+        help="MN operator public key (66 hex chars). Derives the operator "
+             "address and sends registration TX from it (required for Tier 1)."
+    )
+    parser.add_argument(
+        "--address", type=str,
+        help="Prefer UTXO at this address (alternative to --operator-pubkey)"
+    )
     args = parser.parse_args()
 
     cli = find_cli()
     print(f"Using CLI: {cli}\n")
+
+    # Derive operator address from pubkey (takes priority over --address)
+    if args.operator_pubkey:
+        operator_addr = pubkey_to_address(args.operator_pubkey)
+        print(f"Operator pubkey: {args.operator_pubkey}")
+        print(f"Operator address: {operator_addr}")
+        build_and_send_tx._preferred_address = operator_addr
+    elif args.address:
+        build_and_send_tx._preferred_address = args.address
+        print(f"Preferred UTXO address: {args.address}")
 
     if args.status:
         show_status(cli)

@@ -639,11 +639,26 @@ async function renderConfigWallets() {
     grid.innerHTML = html;
 }
 
+function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text);
+    } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+    }
+}
+
 function copyWalletAddress(chainId, btn) {
     const card = btn.closest('.wallet-card');
     const addr = card?.querySelector('.address-fixed')?.textContent;
     if (addr && addr !== 'Not available' && addr !== 'Loading...') {
-        navigator.clipboard.writeText(addr);
+        copyToClipboard(addr);
         const orig = btn.innerHTML;
         btn.innerHTML = '&#10003;';
         setTimeout(() => { btn.innerHTML = orig; }, 1200);
@@ -708,7 +723,7 @@ function copyAddress(chain) {
     const card = document.querySelector(`.wallet-card[data-chain="${chain}"]`);
     const addr = card?.querySelector('.address-fixed')?.textContent;
     if (addr && addr !== 'Not available' && addr !== 'Loading...') {
-        navigator.clipboard.writeText(addr);
+        copyToClipboard(addr);
     }
 }
 

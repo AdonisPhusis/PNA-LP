@@ -188,86 +188,105 @@ def _load_lp_name():
         pass
     return os.environ.get("LP_NAME", "pna LP")
 
-# Default LP config
+
+def _lp_config_path():
+    """Path to per-LP persistent config file."""
+    lp_id = os.environ.get("LP_ID", "lp_pna_01")
+    return os.path.expanduser(f"~/.bathron/lp_config_{lp_id}.json")
+
+
+def _load_lp_config():
+    """Load per-LP config from disk. Returns dict or None if not found."""
+    path = _lp_config_path()
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            log.info(f"LP config loaded from {path}")
+            return data
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as e:
+        log.warning(f"LP config file corrupt ({path}): {e}")
+        return None
+
+
+def _save_lp_config():
+    """Persist current LP_CONFIG (pairs, name, confirmations) to disk."""
+    path = _lp_config_path()
+    data = {
+        "name": LP_CONFIG.get("name"),
+        "pairs": LP_CONFIG.get("pairs", {}),
+        "confirmations": LP_CONFIG.get("confirmations", {}),
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        log.info(f"LP config saved to {path}")
+    except Exception as e:
+        log.warning(f"Could not persist LP config: {e}")
+
+
+# Default pairs (only functional pairs — BTC/M1, USDC/M1, BTC/USDC)
+_DEFAULT_PAIRS = {
+    "BTC/M1": {
+        "enabled": True,
+        "rate": BTC_M1_FIXED_RATE,  # FIXED, not configurable
+        "spread_bid": 0.5,  # % - user sells BTC
+        "spread_ask": 0.5,  # % - user buys BTC
+        "min": 0.00001,     # BTC (testnet: very low for testing)
+        "max": 1.0,         # BTC
+    },
+    "USDC/M1": {
+        "enabled": True,
+        "rate": 1309.0,     # M1 per USDC (from price feed)
+        "spread_bid": 0.5,  # % - user sells USDC
+        "spread_ask": 0.5,  # % - user buys USDC
+        "min": 1,           # USDC (testnet: low for testing)
+        "max": 100000,      # USDC
+    },
+    "BTC/USDC": {
+        "enabled": True,
+        # Derived from BTC/M1 and USDC/M1
+        "min": 0.00001,     # BTC (testnet: very low for testing)
+        "max": 1.0,
+    },
+}
+
+_DEFAULT_CONFIRMATIONS = {
+    "BTC": {
+        "default": 1,       # Default fallback
+        "min": 0,           # 0-conf for small amounts (CLS model: LP takes risk)
+        "max": 3,           # Maximum for large amounts
+        # Tiered confirmations by amount (must match BTC_CONFIRMATION_TIERS in sdk/core.py)
+        "tiers": [
+            {"max_btc": 0.1, "confirmations": 0},    # <0.1 BTC: 0-conf instant (CLS model)
+            {"max_btc": 1.0, "confirmations": 1},    # <1 BTC: 1 conf (~10 min)
+            {"max_btc": 100.0, "confirmations": 3},   # >=1 BTC: 3 conf (~30 min)
+        ],
+    },
+    "USDC": {
+        "default": 1,       # Base L2 is fast
+        "min": 1,
+        "max": 3,
+    },
+    "M1": {
+        "default": 1,       # HU finality is fast (~1 min)
+        "min": 1,
+        "max": 2,
+    },
+}
+
+# Build LP_CONFIG: load from disk if available, otherwise use defaults
+_saved = _load_lp_config()
+
 LP_CONFIG = {
     "id": os.environ.get("LP_ID", "lp_pna_01"),
-    "name": _load_lp_name(),
+    "name": (_saved or {}).get("name") or _load_lp_name(),
     "version": "0.1.0",
     "endpoint": None,  # Set dynamically
-    "pairs": {
-        "BTC/M1": {
-            "enabled": True,
-            "rate": BTC_M1_FIXED_RATE,  # FIXED, not configurable
-            "spread_bid": 0.5,  # % - user sells BTC
-            "spread_ask": 0.5,  # % - user buys BTC
-            "min": 0.00001,     # BTC (testnet: very low for testing)
-            "max": 1.0,         # BTC
-        },
-        "USDC/M1": {
-            "enabled": True,
-            "rate": 1309.0,     # M1 per USDC (from price feed)
-            "spread_bid": 0.5,  # % - user sells USDC
-            "spread_ask": 0.5,  # % - user buys USDC
-            "min": 1,           # USDC (testnet: low for testing)
-            "max": 100000,      # USDC
-        },
-        "PIVX/M1": {
-            "enabled": True,
-            "rate": 25_000_000,  # M1 per PIVX (~$0.25)
-            "spread_bid": 1.0,
-            "spread_ask": 1.0,
-            "min": 1,
-            "max": 100000,
-        },
-        "DASH/M1": {
-            "enabled": True,
-            "rate": 2_800_000_000,  # M1 per DASH (~$28)
-            "spread_bid": 1.0,
-            "spread_ask": 1.0,
-            "min": 0.01,
-            "max": 1000,
-        },
-        "ZEC/M1": {
-            "enabled": True,
-            "rate": 3_500_000_000,  # M1 per ZEC (~$35)
-            "spread_bid": 1.0,
-            "spread_ask": 1.0,
-            "min": 0.01,
-            "max": 1000,
-        },
-        "BTC/USDC": {
-            "enabled": True,
-            # Derived from BTC/M1 and USDC/M1
-            "min": 0.00001,     # BTC (testnet: very low for testing)
-            "max": 1.0,
-        },
-    },
-    # LP-configurable confirmation requirements
-    # Lower = faster settlement but higher reorg risk
-    # Higher = slower but safer (LP bears the risk)
-    "confirmations": {
-        "BTC": {
-            "default": 1,       # Default fallback
-            "min": 0,           # 0-conf for small amounts (CLS model: LP takes risk)
-            "max": 3,           # Maximum for large amounts
-            # Tiered confirmations by amount (must match BTC_CONFIRMATION_TIERS in sdk/core.py)
-            "tiers": [
-                {"max_btc": 0.1, "confirmations": 0},    # <0.1 BTC: 0-conf instant (CLS model)
-                {"max_btc": 1.0, "confirmations": 1},    # <1 BTC: 1 conf (~10 min)
-                {"max_btc": 100.0, "confirmations": 3},   # >=1 BTC: 3 conf (~30 min)
-            ],
-        },
-        "USDC": {
-            "default": 1,       # Base L2 is fast
-            "min": 1,
-            "max": 3,
-        },
-        "M1": {
-            "default": 1,       # HU finality is fast (~1 min)
-            "min": 1,
-            "max": 2,
-        },
-    },
+    "pairs": (_saved or {}).get("pairs") or dict(_DEFAULT_PAIRS),
+    "confirmations": (_saved or {}).get("confirmations") or dict(_DEFAULT_CONFIRMATIONS),
     "inventory": {
         "btc": 0.0,
         "m1": 0,
@@ -280,6 +299,10 @@ LP_CONFIG = {
         "uptime_start": int(time.time()),
     },
 }
+
+# Ensure BTC/M1 rate is always the fixed rate (not overridable from config file)
+if "BTC/M1" in LP_CONFIG["pairs"]:
+    LP_CONFIG["pairs"]["BTC/M1"]["rate"] = BTC_M1_FIXED_RATE
 
 # Legacy compatibility
 DEFAULT_LP = {
@@ -803,16 +826,19 @@ async def get_reputation():
 
 @app.get("/api/assets")
 async def get_assets():
-    """List supported assets and pairs."""
+    """List supported assets and pairs (LP-specific, from enabled config)."""
     pairs = []
-    symbols = list(ASSETS.keys())
-    for i, a in enumerate(symbols):
-        for b in symbols[i+1:]:
-            pairs.append({"from": a, "to": b})
-            pairs.append({"from": b, "to": a})
+    active_symbols = set()
+    for pair_key, pair_config in LP_CONFIG["pairs"].items():
+        if not pair_config.get("enabled", True):
+            continue
+        parts = pair_key.split("/")
+        pairs.append({"from": parts[0], "to": parts[1]})
+        pairs.append({"from": parts[1], "to": parts[0]})
+        active_symbols.update(parts)
 
     return {
-        "assets": ASSETS,
+        "assets": {k: v for k, v in ASSETS.items() if k in active_symbols},
         "pairs": pairs,
         "protocol_fee": 0,
     }
@@ -839,6 +865,14 @@ async def get_quote(
         raise HTTPException(400, f"Unknown asset: {to_asset}")
     if from_asset == to_asset:
         raise HTTPException(400, "Cannot swap same asset")
+
+    # Check if this pair is enabled on this LP
+    pair_key_fwd = f"{from_asset}/{to_asset}"
+    pair_key_rev = f"{to_asset}/{from_asset}"
+    fwd_cfg = LP_CONFIG["pairs"].get(pair_key_fwd, {})
+    rev_cfg = LP_CONFIG["pairs"].get(pair_key_rev, {})
+    if not (fwd_cfg.get("enabled", False) or rev_cfg.get("enabled", False)):
+        raise HTTPException(400, f"Pair {from_asset}/{to_asset} not enabled on this LP")
 
     # Fetch live price (updates LP_CONFIG automatically)
     await fetch_live_btc_usdc_price()
@@ -1565,6 +1599,9 @@ async def update_lp_config(config: LPConfigUpdate):
                     if field in conf_data:
                         LP_CONFIG["confirmations"][asset][field] = conf_data[field]
                 log.info(f"Confirmation config updated: {asset} = {conf_data}")
+
+    # Persist all config changes to disk
+    _save_lp_config()
 
     return {"success": True, "config": LP_CONFIG}
 
